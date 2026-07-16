@@ -1,0 +1,6 @@
+.git
+.venv
+infra/.venv
+infra/cdk.out
+__pycache__
+.DS_Store
