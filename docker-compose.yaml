@@ -12,12 +12,20 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://video_processing:video_processing@db:5432/video_processing
       PYTHONPATH: /app/src
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: eu-north-1
+      S3_BUCKET_NAME: video-processing-local
+      S3_ENDPOINT_URL: http://localstack:4566
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:4566
     ports:
       - "8000:8000"
     volumes:
       - ./src:/app/src
     depends_on:
       db:
+        condition: service_healthy
+      localstack:
         condition: service_healthy
 
   db:
@@ -35,6 +43,22 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      AWS_DEFAULT_REGION: eu-north-1
+      SERVICES: s3
+      S3_BUCKET_NAME: video-processing-local
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:4566/_localstack/health | grep -q '\"s3\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh:ro
 
 volumes:
   postgres_data:

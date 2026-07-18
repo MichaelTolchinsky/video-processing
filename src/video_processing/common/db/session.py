@@ -1,10 +1,12 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from collections.abc import Generator
 
-from video_processing.common.settings import settings
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from video_processing.common.config.settings import settings
 
 engine = create_engine(
-    settings.database_url,
+    settings.sqlalchemy_database_url,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=5,
@@ -16,3 +18,8 @@ SessionFactory = sessionmaker(
     autoflush=False,
     expire_on_commit=False
 )
+
+
+def get_db_session() -> Generator[Session, None, None]:
+    with SessionFactory() as session:
+        yield session

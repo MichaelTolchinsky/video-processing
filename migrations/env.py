@@ -5,7 +5,7 @@ from sqlalchemy import pool
 
 from alembic import context
 
-from video_processing.common.settings import settings
+from video_processing.common.config.settings import settings
 from video_processing.common.models.generated_asset import GeneratedAsset
 from video_processing.common.models.processing_job import ProcessingJob
 from video_processing.common.models.video import Video
