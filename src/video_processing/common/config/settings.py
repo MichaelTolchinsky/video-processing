@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     s3_public_endpoint_url: str | None = None
 
     @property
-    def sqlalchemy_database_url(self) -> str | URL:
+    def sqlalchemy_database_url(self) -> str:
         if self.database_url is not None:
             return self.database_url
 
@@ -37,7 +37,7 @@ class Settings(BaseSettings):
             host=self.database_host,
             port=self.database_port,
             database=self.database_name,
-        )
+        ).render_as_string(hide_password=False)
 
 
 settings = Settings()
