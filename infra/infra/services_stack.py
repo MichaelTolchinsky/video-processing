@@ -1,4 +1,4 @@
-from aws_cdk import CfnOutput, Stack, aws_ec2 as ec2, aws_ecr as ecr, aws_ecs as ecs, aws_elasticloadbalancingv2 as elbv2, aws_rds as rds, aws_s3 as s3
+from aws_cdk import CfnOutput, Stack, aws_ec2 as ec2, aws_ecr as ecr, aws_ecs as ecs, aws_elasticloadbalancingv2 as elbv2, aws_iam as iam, aws_rds as rds, aws_s3 as s3
 from constructs import Construct
 
 class ServicesStack(Stack):
@@ -24,7 +24,12 @@ class ServicesStack(Stack):
             cpu=256,
             memory_limit_mib=512,
         )
-        self.video_bucket.grant_put(self.api_task_definition.task_role)
+        self.api_task_definition.task_role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[self.video_bucket.arn_for_objects("uploads/*")],
+            )
+        )
 
         application_image = ecs.ContainerImage.from_ecr_repository(
             self.container_repository,
@@ -116,6 +121,7 @@ class ServicesStack(Stack):
             cluster=self.cluster,
             task_definition=self.api_task_definition,
             desired_count=1,
+            min_healthy_percent=100,
             assign_public_ip=False,
             vpc_subnets=ec2.SubnetSelection(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
