@@ -115,6 +115,19 @@ class PipelineStack(Stack):
             )
         )
 
+        # Read-only; needed so the workflow can look up ECS/ECR resource
+        # names dynamically instead of hardcoding CDK-generated values.
+        # The trailing "/*" covers CloudFormation's per-stack unique suffix.
+        self.deploy_role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=["cloudformation:DescribeStacks"],
+                resources=[
+                    f"arn:aws:cloudformation:{self.region}:{self.account}:stack/PlatformStack/*",
+                    f"arn:aws:cloudformation:{self.region}:{self.account}:stack/ServicesStack/*",
+                ],
+            )
+        )
+
         # Needed because RegisterTaskDefinition takes the execution/task role
         # ARNs as plain parameters — AWS requires the caller to be allowed to
         # pass those specific roles to ECS, separately from ECS's own trust
