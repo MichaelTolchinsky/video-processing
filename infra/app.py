@@ -35,6 +35,10 @@ PipelineStack(
     app,
     "PipelineStack",
     github_repository="MichaelTolchinsky/video-processing",
+    # Owner/repo numeric IDs GitHub appends to the OIDC "sub" claim once a
+    # name has ever changed — confirmed via CloudTrail against this repo.
+    # Not secret: these are public, immutable GitHub identifiers.
+    github_repository_with_ids="MichaelTolchinsky@62743973/video-processing@1305573378",
     container_repository=platform_stack.container_repository,
     cluster=services_stack.cluster,
     api_task_definition=services_stack.api_task_definition,
