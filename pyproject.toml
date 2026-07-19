@@ -18,3 +18,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/video_processing"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.22",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+# Pyflakes + pycodestyle (E/W) + isort (I) + pyupgrade (UP) + bugbear (B):
+# a solid, low-noise baseline rather than every rule set ruff offers.
+select = ["E", "F", "W", "I", "UP", "B"]

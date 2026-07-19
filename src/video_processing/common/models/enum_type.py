@@ -1,5 +1,7 @@
 from enum import Enum as PythonEnum
+
 from sqlalchemy import Enum
+
 
 def enum_type(enum_class: type[PythonEnum]) -> Enum:
     return Enum(

@@ -4,13 +4,15 @@ from datetime import datetime
 from sqlalchemy import DateTime, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+
 from video_processing.common.db.base import Base
 from video_processing.common.models.enum_type import enum_type
 from video_processing.common.models.video_status import VideoStatus
 
+
 class Video(Base):
     __tablename__ = "videos"
-    
+
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,

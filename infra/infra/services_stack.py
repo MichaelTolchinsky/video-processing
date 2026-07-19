@@ -1,27 +1,50 @@
-from aws_cdk import CfnOutput, Stack, aws_ec2 as ec2, aws_ecr as ecr, aws_ecs as ecs, aws_elasticloadbalancingv2 as elbv2, aws_iam as iam, aws_rds as rds, aws_s3 as s3, aws_sqs as sqs
+from aws_cdk import CfnOutput, Stack
+from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_ecr as ecr
+from aws_cdk import aws_ecs as ecs
+from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_rds as rds
+from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_sqs as sqs
 from constructs import Construct
 
+
 class ServicesStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, *, vpc: ec2.IVpc, container_repository: ecr.IRepository, database: rds.IDatabaseInstance, database_security_group: ec2.ISecurityGroup, video_bucket: s3.IBucket, processing_queue: sqs.IQueue, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        vpc: ec2.IVpc,
+        container_repository: ecr.IRepository,
+        database: rds.IDatabaseInstance,
+        database_security_group: ec2.ISecurityGroup,
+        video_bucket: s3.IBucket,
+        processing_queue: sqs.IQueue,
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
-        
+
         self.vpc = vpc
         self.container_repository = container_repository
         self.database = database
         self.database_security_group = database_security_group
         self.video_bucket = video_bucket
         self.processing_queue = processing_queue
-        
+
         self.cluster = ecs.Cluster(
             self,
             "VideoProcessingCluster",
+            cluster_name="video-processing-cluster",
             vpc=self.vpc,
             container_insights_v2=ecs.ContainerInsights.ENABLED,
         )
-        
+
         self.api_task_definition = ecs.FargateTaskDefinition(
             self,
             "ApiTaskDefinition",
+            family="video-processing-api",
             cpu=256,
             memory_limit_mib=512,
         )
@@ -36,7 +59,7 @@ class ServicesStack(Stack):
             self.container_repository,
             tag="latest",
         )
-        
+
         api_container = self.api_task_definition.add_container(
             "ApiContainer",
             image=application_image,
@@ -73,11 +96,11 @@ class ServicesStack(Stack):
         database_secret.grant_read(
             self.api_task_definition.execution_role,
         )
-        
+
         api_container.add_port_mappings(
             ecs.PortMapping(container_port=8000)
         )
-        
+
         self.api_security_group = ec2.SecurityGroup(
             self,
             "ApiSecurityGroup",
@@ -98,6 +121,7 @@ class ServicesStack(Stack):
         self.migration_task_definition = ecs.FargateTaskDefinition(
             self,
             "MigrationTaskDefinition",
+            family="video-processing-migration",
             cpu=256,
             memory_limit_mib=512,
         )
@@ -122,6 +146,7 @@ class ServicesStack(Stack):
         self.worker_task_definition = ecs.FargateTaskDefinition(
             self,
             "WorkerTaskDefinition",
+            family="video-processing-worker",
             cpu=512,
             memory_limit_mib=1024,
         )
@@ -180,6 +205,7 @@ class ServicesStack(Stack):
         self.worker_service = ecs.FargateService(
             self,
             "WorkerService",
+            service_name="video-processing-worker",
             cluster=self.cluster,
             task_definition=self.worker_task_definition,
             desired_count=1,
@@ -190,10 +216,11 @@ class ServicesStack(Stack):
             ),
             security_groups=[self.worker_security_group],
         )
-        
+
         self.api_service = ecs.FargateService(
             self,
             "ApiService",
+            service_name="video-processing-api",
             cluster=self.cluster,
             task_definition=self.api_task_definition,
             desired_count=1,
@@ -227,18 +254,18 @@ class ServicesStack(Stack):
             ),
             security_group=self.alb_security_group,
         )
-        
+
         self.api_security_group.add_ingress_rule(
             self.alb_security_group,
             ec2.Port.tcp(8000)
         )
-        
+
         listener = self.load_balancer.add_listener(
             "HttpListener",
             port=80,
             open=False,
         )
-        
+
         listener.add_targets(
             "ApiTargets",
             port=8000,
@@ -248,7 +275,7 @@ class ServicesStack(Stack):
                 healthy_http_codes="200"
             )
         )
-        
+
         CfnOutput(self, "ApiUrl", value=f"http://{self.load_balancer.load_balancer_dns_name}")
         CfnOutput(
             self,
@@ -260,3 +287,14 @@ class ServicesStack(Stack):
             "MigrationTaskDefinitionArn",
             value=self.migration_task_definition.task_definition_arn,
         )
+        CfnOutput(self, "ClusterName", value=self.cluster.cluster_name)
+        CfnOutput(self, "ApiServiceName", value=self.api_service.service_name)
+        CfnOutput(self, "WorkerServiceName", value=self.worker_service.service_name)
+        CfnOutput(self, "ApiTaskDefinitionFamily", value=self.api_task_definition.family)
+        CfnOutput(self, "WorkerTaskDefinitionFamily", value=self.worker_task_definition.family)
+        CfnOutput(
+            self,
+            "MigrationTaskDefinitionFamily",
+            value=self.migration_task_definition.family,
+        )
+        CfnOutput(self, "ContainerRepositoryUri", value=self.container_repository.repository_uri)
