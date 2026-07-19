@@ -1,5 +1,5 @@
-from sqlalchemy.engine import URL
 from pydantic_settings import BaseSettings
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):

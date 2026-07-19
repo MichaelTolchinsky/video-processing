@@ -1,15 +1,17 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 
 from video_processing.common.config.settings import settings
-from video_processing.common.models.generated_asset import GeneratedAsset
-from video_processing.common.models.processing_job import ProcessingJob
-from video_processing.common.models.video import Video
 from video_processing.common.db.base import Base
+
+# Imported for their side effect only: each import registers the model's
+# table on Base.metadata, which is what makes `alembic revision --autogenerate`
+# able to see it. Keep even though nothing here references the class directly.
+from video_processing.common.models.generated_asset import GeneratedAsset  # noqa: F401
+from video_processing.common.models.processing_job import ProcessingJob  # noqa: F401
+from video_processing.common.models.video import Video  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

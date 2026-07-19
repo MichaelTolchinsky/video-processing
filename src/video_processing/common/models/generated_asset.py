@@ -6,8 +6,8 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from video_processing.common.db.base import Base
-from video_processing.common.models.enum_type import enum_type
 from video_processing.common.models.asset_type import AssetType
+from video_processing.common.models.enum_type import enum_type
 
 
 class GeneratedAsset(Base):

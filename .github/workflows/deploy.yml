@@ -1,0 +1,161 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: eu-north-1
+  ECS_STACK_NAME: ServicesStack
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - run: uv sync --locked
+      - run: uv run ruff check .
+
+  deploy:
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      # id-token: write is what lets this job exchange a GitHub-issued OIDC
+      # token for temporary AWS credentials — no access keys stored anywhere.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Resources have CDK-managed names/ARNs that could change if the
+      # stacks are ever restructured; look them up instead of hardcoding
+      # them here, matching how the stacks expose them via CfnOutput.
+      - name: Look up deployed resource names
+        id: outputs
+        run: |
+          services_outputs=$(aws cloudformation describe-stacks \
+            --stack-name "${{ env.ECS_STACK_NAME }}" \
+            --query 'Stacks[0].Outputs' --output json)
+          platform_outputs=$(aws cloudformation describe-stacks \
+            --stack-name PlatformStack \
+            --query 'Stacks[0].Outputs' --output json)
+
+          value() { echo "$1" | jq -r --arg key "$2" '.[] | select(.OutputKey==$key) | .OutputValue'; }
+
+          {
+            echo "cluster-name=$(value "$services_outputs" ClusterName)"
+            echo "api-service-name=$(value "$services_outputs" ApiServiceName)"
+            echo "worker-service-name=$(value "$services_outputs" WorkerServiceName)"
+            echo "api-task-family=$(value "$services_outputs" ApiTaskDefinitionFamily)"
+            echo "worker-task-family=$(value "$services_outputs" WorkerTaskDefinitionFamily)"
+            echo "migration-task-family=$(value "$services_outputs" MigrationTaskDefinitionFamily)"
+            echo "repository-uri=$(value "$services_outputs" ContainerRepositoryUri)"
+            echo "api-security-group-id=$(value "$services_outputs" ApiSecurityGroupId)"
+            echo "api-url=$(value "$services_outputs" ApiUrl)"
+            echo "subnet-ids=$(value "$platform_outputs" ApplicationSubnetIds)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # SHA tag: immutable, what the API/worker task definitions below
+          # pin to. "latest" tag: kept for the migration task definition,
+          # which intentionally always runs whatever is newest (a one-off
+          # task doesn't need a pinned revision the way a running service does).
+          tags: |
+            ${{ steps.outputs.outputs.repository-uri }}:${{ github.sha }}
+            ${{ steps.outputs.outputs.repository-uri }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Fetch current API task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ steps.outputs.outputs.api-task-family }}" \
+            --query taskDefinition > api-task-def.json
+
+      - name: Render API task definition with the new image
+        id: api-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: api-task-def.json
+          container-name: ApiContainer
+          image: ${{ steps.outputs.outputs.repository-uri }}:${{ github.sha }}
+
+      - name: Fetch current worker task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ steps.outputs.outputs.worker-task-family }}" \
+            --query taskDefinition > worker-task-def.json
+
+      - name: Render worker task definition with the new image
+        id: worker-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: worker-task-def.json
+          container-name: WorkerContainer
+          image: ${{ steps.outputs.outputs.repository-uri }}:${{ github.sha }}
+
+      - name: Run database migration
+        run: |
+          task_arn=$(aws ecs run-task \
+            --cluster "${{ steps.outputs.outputs.cluster-name }}" \
+            --launch-type FARGATE \
+            --task-definition "${{ steps.outputs.outputs.migration-task-family }}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.outputs.outputs.subnet-ids }}],securityGroups=[${{ steps.outputs.outputs.api-security-group-id }}],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' --output text)
+
+          aws ecs wait tasks-stopped --cluster "${{ steps.outputs.outputs.cluster-name }}" --tasks "$task_arn"
+
+          exit_code=$(aws ecs describe-tasks \
+            --cluster "${{ steps.outputs.outputs.cluster-name }}" \
+            --tasks "$task_arn" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+
+          if [ "$exit_code" != "0" ]; then
+            echo "Migration task failed with exit code $exit_code"
+            exit 1
+          fi
+
+      # These register the rendered task definition as a new revision, point
+      # the service at it, and wait for the rollout to stabilize — migration
+      # above already gated this on the new image working against the DB.
+      - name: Deploy API service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.api-task-def.outputs.task-definition }}
+          service: ${{ steps.outputs.outputs.api-service-name }}
+          cluster: ${{ steps.outputs.outputs.cluster-name }}
+          wait-for-service-stability: true
+
+      - name: Deploy worker service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.worker-task-def.outputs.task-definition }}
+          service: ${{ steps.outputs.outputs.worker-service-name }}
+          cluster: ${{ steps.outputs.outputs.cluster-name }}
+          wait-for-service-stability: true
+
+      - name: Smoke test
+        run: curl --fail --silent --show-error "${{ steps.outputs.outputs.api-url }}/health/ready"

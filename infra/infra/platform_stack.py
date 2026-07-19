@@ -1,5 +1,12 @@
-from aws_cdk import Duration, RemovalPolicy, Stack, aws_ec2 as ec2, aws_s3 as s3, aws_sqs as sqs, aws_s3_notifications as s3_notifications, aws_rds as rds, aws_ecr as ecr
+from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
+from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_ecr as ecr
+from aws_cdk import aws_rds as rds
+from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_s3_notifications as s3_notifications
+from aws_cdk import aws_sqs as sqs
 from constructs import Construct
+
 
 class PlatformStack(Stack):
 
@@ -26,7 +33,7 @@ class PlatformStack(Stack):
                 ),
             ]
         )
-        
+
         self.video_bucket = s3.Bucket(
             self,
             "VideoBucket",
@@ -36,7 +43,7 @@ class PlatformStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
         )
-        
+
         self.dead_letter_queue = sqs.Queue(
             self,
             "ProcessingDeadLetterQueue",
@@ -44,7 +51,7 @@ class PlatformStack(Stack):
             encryption=sqs.QueueEncryption.SQS_MANAGED,
             enforce_ssl=True
         )
-        
+
         self.processing_queue = sqs.Queue(
             self,
             "ProcessingQueue",
@@ -57,13 +64,13 @@ class PlatformStack(Stack):
                 max_receive_count=3
             )
         )
-        
+
         self.video_bucket.add_event_notification(
             s3.EventType.OBJECT_CREATED,
             s3_notifications.SqsDestination(self.processing_queue),
             s3.NotificationKeyFilter(prefix="uploads/")
         )
-        
+
         self.database_security_group = ec2.SecurityGroup(
             self,
             "DatabaseSecurityGroup",
@@ -71,7 +78,7 @@ class PlatformStack(Stack):
             description="Control access to PostgreSQL",
             allow_all_outbound=False
         )
-        
+
         self.database = rds.DatabaseInstance(
             self,
             "VideoDatabase",
@@ -97,7 +104,7 @@ class PlatformStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             delete_automated_backups=True
         )
-        
+
         self.container_repository = ecr.Repository(
             self,
             "ContainerRepository",
@@ -108,4 +115,17 @@ class PlatformStack(Stack):
             ],
             removal_policy=RemovalPolicy.DESTROY,
             empty_on_delete=True,
+        )
+
+        # Exposed for the deploy pipeline, which needs these to run the
+        # one-off migration task via `ecs run-task` (it has no other way to
+        # discover them — they're otherwise just CDK's own internal
+        # cross-stack export names).
+        application_subnet_ids = self.vpc.select_subnets(
+            subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        ).subnet_ids
+        CfnOutput(
+            self,
+            "ApplicationSubnetIds",
+            value=",".join(application_subnet_ids),
         )
