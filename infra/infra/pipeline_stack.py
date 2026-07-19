@@ -23,6 +23,7 @@ class PipelineStack(Stack):
         construct_id: str,
         *,
         github_repository: str,
+        github_repository_with_ids: str,
         container_repository: ecr.IRepository,
         cluster: ecs.ICluster,
         api_task_definition: ecs.FargateTaskDefinition,
@@ -43,6 +44,11 @@ class PipelineStack(Stack):
         # StringLike on the "sub" claim restricts this role to workflows
         # running on `main` in this exact repo — a fork or a PR branch can't
         # assume it, even though the OIDC provider itself is account-wide.
+        #
+        # Two accepted forms because GitHub appends the owner/repo's
+        # immutable numeric IDs to "sub" once either has ever been renamed
+        # (verified via CloudTrail: this repo/owner triggers the ID-suffixed
+        # form). Both list exact matches — no wildcards, so no broadening.
         self.deploy_role = iam.Role(
             self,
             "GitHubActionsDeployRole",
@@ -55,9 +61,10 @@ class PipelineStack(Stack):
                         f"{_GITHUB_OIDC_ISSUER_HOST}:aud": "sts.amazonaws.com",
                     },
                     "StringLike": {
-                        f"{_GITHUB_OIDC_ISSUER_HOST}:sub": (
-                            f"repo:{github_repository}:ref:refs/heads/main"
-                        ),
+                        f"{_GITHUB_OIDC_ISSUER_HOST}:sub": [
+                            f"repo:{github_repository}:ref:refs/heads/main",
+                            f"repo:{github_repository_with_ids}:ref:refs/heads/main",
+                        ],
                     },
                 },
                 assume_role_action="sts:AssumeRoleWithWebIdentity",
