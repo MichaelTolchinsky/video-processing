@@ -1,8 +1,8 @@
-from aws_cdk import CfnOutput, Stack, aws_ec2 as ec2, aws_ecr as ecr, aws_ecs as ecs, aws_elasticloadbalancingv2 as elbv2, aws_iam as iam, aws_rds as rds, aws_s3 as s3
+from aws_cdk import CfnOutput, Stack, aws_ec2 as ec2, aws_ecr as ecr, aws_ecs as ecs, aws_elasticloadbalancingv2 as elbv2, aws_iam as iam, aws_rds as rds, aws_s3 as s3, aws_sqs as sqs
 from constructs import Construct
 
 class ServicesStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, *, vpc: ec2.IVpc, container_repository: ecr.IRepository, database: rds.IDatabaseInstance, database_security_group: ec2.ISecurityGroup, video_bucket: s3.IBucket, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, *, vpc: ec2.IVpc, container_repository: ecr.IRepository, database: rds.IDatabaseInstance, database_security_group: ec2.ISecurityGroup, video_bucket: s3.IBucket, processing_queue: sqs.IQueue, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         
         self.vpc = vpc
@@ -10,6 +10,7 @@ class ServicesStack(Stack):
         self.database = database
         self.database_security_group = database_security_group
         self.video_bucket = video_bucket
+        self.processing_queue = processing_queue
         
         self.cluster = ecs.Cluster(
             self,
@@ -114,6 +115,81 @@ class ServicesStack(Stack):
         database_secret.grant_read(
             self.migration_task_definition.execution_role,
         )
+
+        # The worker is a long-running poller, not an HTTP service: no port
+        # mappings, no ALB target, just a Fargate service so it can restart
+        # on failure and scale independently of the API (per the NFRs).
+        self.worker_task_definition = ecs.FargateTaskDefinition(
+            self,
+            "WorkerTaskDefinition",
+            cpu=512,
+            memory_limit_mib=1024,
+        )
+        worker_container = self.worker_task_definition.add_container(
+            "WorkerContainer",
+            image=application_image,
+            command=["python", "-m", "video_processing.worker.main"],
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="worker"),
+            environment={
+                "AWS_REGION": self.region,
+                "S3_BUCKET_NAME": self.video_bucket.bucket_name,
+                "SQS_QUEUE_URL": self.processing_queue.queue_url,
+            },
+        )
+        for name, secret in database_secrets.items():
+            worker_container.add_secret(name, secret)
+        database_secret.grant_read(
+            self.worker_task_definition.execution_role,
+        )
+
+        # Least privilege, split by direction: read only the originals it
+        # downloads, write only the assets it generates.
+        self.worker_task_definition.task_role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[self.video_bucket.arn_for_objects("uploads/*")],
+            )
+        )
+        self.worker_task_definition.task_role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[self.video_bucket.arn_for_objects("assets/*")],
+            )
+        )
+        self.processing_queue.grant_consume_messages(
+            self.worker_task_definition.task_role,
+        )
+
+        self.worker_security_group = ec2.SecurityGroup(
+            self,
+            "WorkerSecurityGroup",
+            vpc=self.vpc,
+            description="Controls access for the worker tasks",
+            allow_all_outbound=True,
+        )
+        ec2.CfnSecurityGroupIngress(
+            self,
+            "WorkerToDatabaseIngress",
+            group_id=self.database_security_group.security_group_id,
+            ip_protocol="tcp",
+            from_port=5432,
+            to_port=5432,
+            source_security_group_id=self.worker_security_group.security_group_id,
+        )
+
+        self.worker_service = ecs.FargateService(
+            self,
+            "WorkerService",
+            cluster=self.cluster,
+            task_definition=self.worker_task_definition,
+            desired_count=1,
+            min_healthy_percent=100,
+            assign_public_ip=False,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+            ),
+            security_groups=[self.worker_security_group],
+        )
         
         self.api_service = ecs.FargateService(
             self,
@@ -168,7 +244,7 @@ class ServicesStack(Stack):
             port=8000,
             targets=[self.api_service],
             health_check=elbv2.HealthCheck(
-                path="/health",
+                path="/health/ready",
                 healthy_http_codes="200"
             )
         )

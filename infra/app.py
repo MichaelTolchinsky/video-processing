@@ -25,6 +25,7 @@ ServicesStack(
     database=platform_stack.database,
     database_security_group=platform_stack.database_security_group,
     video_bucket=platform_stack.video_bucket,
+    processing_queue=platform_stack.processing_queue,
     env=cdk.Environment(
         account=os.getenv("CDK_DEFAULT_ACCOUNT"),
         region=os.getenv("CDK_DEFAULT_REGION"),

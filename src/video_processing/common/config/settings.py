@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     s3_bucket_name: str
     s3_endpoint_url: str | None = None
     s3_public_endpoint_url: str | None = None
+    sqs_queue_url: str | None = None
+    sqs_endpoint_url: str | None = None
 
     @property
     def sqlalchemy_database_url(self) -> str:

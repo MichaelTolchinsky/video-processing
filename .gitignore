@@ -9,3 +9,6 @@ __pycache__
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Local test media used for manual upload testing
+*.mp4
