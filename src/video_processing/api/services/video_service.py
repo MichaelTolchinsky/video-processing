@@ -4,12 +4,11 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePath
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from video_processing.api.schemas.video_service import AssetDownload, CreatedUpload
 from video_processing.common.config.settings import settings
-from video_processing.common.models.generated_asset import GeneratedAsset
+from video_processing.common.db.repositories import generated_asset_repository, video_repository
 from video_processing.common.models.video import Video
 from video_processing.common.models.video_status import VideoStatus
 from video_processing.common.storage.s3 import get_presigning_s3_client
@@ -44,14 +43,6 @@ def _presign_download_url(object_key: str) -> tuple[str, datetime]:
     return download_url, datetime.now(UTC) + _DOWNLOAD_URL_EXPIRATION
 
 
-def _get_assets_for_video(db: Session, video_id: uuid.UUID) -> list[GeneratedAsset]:
-    return list(
-        db.execute(select(GeneratedAsset).where(GeneratedAsset.video_id == video_id))
-        .scalars()
-        .all()
-    )
-
-
 def create_video(db: Session, filename: str, content_type: str) -> CreatedUpload:
     """Create the pending Video row and a presigned S3 upload URL for it.
 
@@ -68,14 +59,14 @@ def create_video(db: Session, filename: str, content_type: str) -> CreatedUpload
         original_object_key=object_key,
         status=VideoStatus.PENDING_UPLOAD,
     )
-    db.add(video)
+    video_repository.create(db, video)
     db.commit()
 
     return CreatedUpload(video=video, upload_url=upload_url, expires_at=expires_at)
 
 
 def get_video(db: Session, video_id: uuid.UUID) -> Video | None:
-    return db.get(Video, video_id)
+    return video_repository.get_by_id(db, video_id)
 
 
 def get_asset_downloads(db: Session, video_id: uuid.UUID) -> list[AssetDownload]:
@@ -85,7 +76,7 @@ def get_asset_downloads(db: Session, video_id: uuid.UUID) -> list[AssetDownload]
     client -- each asset needs its own signed, time-limited GET URL.
     """
     downloads = []
-    for asset in _get_assets_for_video(db, video_id):
+    for asset in generated_asset_repository.list_for_video(db, video_id):
         download_url, expires_at = _presign_download_url(asset.object_key)
         downloads.append(
             AssetDownload(asset=asset, download_url=download_url, expires_at=expires_at)

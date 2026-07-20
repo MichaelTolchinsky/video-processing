@@ -1,15 +1,20 @@
 """Database operations for claiming and finishing processing jobs.
 
 Kept separate from S3/ffmpeg concerns so the retry/idempotency logic can be
-read (and reasoned about) on its own.
+read (and reasoned about) on its own. Raw queries live in
+common/db/repositories/; this module owns the business rules (retry
+semantics, transaction boundaries) built on top of them.
 """
 
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from video_processing.common.db.repositories import (
+    generated_asset_repository,
+    processing_job_repository,
+)
 from video_processing.common.models.asset_type import AssetType
 from video_processing.common.models.generated_asset import GeneratedAsset
 from video_processing.common.models.job_status import JobStatus
@@ -18,15 +23,6 @@ from video_processing.common.models.processing_job import ProcessingJob
 from video_processing.common.models.video import Video
 from video_processing.common.models.video_status import VideoStatus
 from video_processing.worker.processing import VideoMetadata
-
-
-def _get_job(db: Session, video: Video, job_type: JobType) -> ProcessingJob | None:
-    return db.execute(
-        select(ProcessingJob).where(
-            ProcessingJob.video_id == video.id,
-            ProcessingJob.job_type == job_type,
-        )
-    ).scalar_one_or_none()
 
 
 def claim_job(db: Session, video: Video, job_type: JobType) -> ProcessingJob | None:
@@ -39,17 +35,17 @@ def claim_job(db: Session, video: Video, job_type: JobType) -> ProcessingJob | N
     Returns None if the job is already completed, so the caller can treat the
     message as a harmless duplicate and acknowledge it without reprocessing.
     """
-    job = _get_job(db, video, job_type)
+    job = processing_job_repository.get_by_video_and_type(db, video.id, job_type)
     if job is None:
         job = ProcessingJob(video_id=video.id, job_type=job_type)
-        db.add(job)
+        processing_job_repository.create(db, job)
         try:
             db.commit()
         except IntegrityError:
             # Another worker claimed it first (unique video_id + job_type);
             # fall back to the row it created instead of erroring out.
             db.rollback()
-            job = _get_job(db, video, job_type)
+            job = processing_job_repository.get_by_video_and_type(db, video.id, job_type)
 
     if job.status == JobStatus.COMPLETED:
         return None
@@ -70,21 +66,8 @@ def _all_jobs_completed(db: Session, video: Video) -> bool:
 
     Every upload triggers one ProcessingJob per JobType (see worker/main.py),
     so "all done" is simply "as many completed rows as there are job types".
-
-    Flushes first because the session disables autoflush (see
-    common/db/session.py) -- without it, the caller's own just-set
-    `job.status = COMPLETED` wouldn't be visible to this SELECT yet, so the
-    last job to finish would never see itself counted.
     """
-    db.flush()
-    completed_count = db.execute(
-        select(func.count())
-        .select_from(ProcessingJob)
-        .where(
-            ProcessingJob.video_id == video.id,
-            ProcessingJob.status == JobStatus.COMPLETED,
-        )
-    ).scalar_one()
+    completed_count = processing_job_repository.count_completed_for_video(db, video.id)
     return completed_count >= len(JobType.__members__)
 
 
@@ -93,16 +76,13 @@ def _upsert_asset(db: Session, video: Video, asset_type: AssetType, object_key: 
     partial prior failure already wrote one (avoids the UNIQUE(video_id,
     asset_type) constraint rejecting the retry).
     """
-    existing = db.execute(
-        select(GeneratedAsset).where(
-            GeneratedAsset.video_id == video.id,
-            GeneratedAsset.asset_type == asset_type,
-        )
-    ).scalar_one_or_none()
+    existing = generated_asset_repository.get_by_video_and_type(db, video.id, asset_type)
     if existing is not None:
         existing.object_key = object_key
     else:
-        db.add(GeneratedAsset(video_id=video.id, asset_type=asset_type, object_key=object_key))
+        generated_asset_repository.create(
+            db, GeneratedAsset(video_id=video.id, asset_type=asset_type, object_key=object_key)
+        )
 
 
 def complete_metadata_job(
