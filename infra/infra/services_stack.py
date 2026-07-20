@@ -143,12 +143,14 @@ class ServicesStack(Stack):
         # The worker is a long-running poller, not an HTTP service: no port
         # mappings, no ALB target, just a Fargate service so it can restart
         # on failure and scale independently of the API (per the NFRs).
+        # Sized above ffmpeg-thumbnail-only needs: transcoding 2-3 resolution
+        # renditions per upload is meaningfully more CPU-bound.
         self.worker_task_definition = ecs.FargateTaskDefinition(
             self,
             "WorkerTaskDefinition",
             family="video-processing-worker",
-            cpu=512,
-            memory_limit_mib=1024,
+            cpu=1024,
+            memory_limit_mib=2048,
         )
         worker_container = self.worker_task_definition.add_container(
             "WorkerContainer",
