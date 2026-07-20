@@ -39,7 +39,7 @@ Create a new migration after changing a model:
 docker compose run --rm -v "$PWD:/workspace" -w /workspace api alembic revision --autogenerate -m "describe the change"
 ```
 
-Always review the generated migration file before applying it.
+Always review the generated migration file before applying it -- autogenerate is known to be unreliable specifically for the enum columns in this project (`common/models/enum_type.py` uses `create_constraint=True`, an anonymous CHECK constraint, not a native Postgres enum). When an enum gains/loses values, autogenerate tends to emit a same-named `ADD CONSTRAINT` without dropping the old one first, which fails outright; it also won't add a data-fix for rows still holding a removed value, which a straight `ADD CONSTRAINT` would otherwise reject. Expect to hand-write explicit `op.drop_constraint(...)` / `op.create_check_constraint(...)` (and an `op.execute("UPDATE ...")` data-fix if a value was renamed/removed) rather than accepting the generated file as-is.
 
 ## End-to-end test
 
@@ -73,7 +73,7 @@ Expect a "Completed processing for video ..." line within a few seconds.
 curl http://localhost:8000/videos/PASTE_VIDEO_ID
 ```
 
-Expect `status: "completed"`, populated `metadata`, and one `thumbnail` asset with a working `download_url`.
+Expect `status: "completed"`, populated `metadata`, and generated assets: `thumbnail`, plus a `preview_{height}p` rendition for each standard resolution (1080p/720p/480p) strictly below the source's height -- e.g. a 1080p source produces `preview_720p` and `preview_480p` but not a redundant `preview_1080p`. Each asset has a working `download_url`.
 
 **5. Inspect LocalStack directly (optional)**
 
