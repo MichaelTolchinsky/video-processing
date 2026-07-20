@@ -19,6 +19,7 @@ def client(db, monkeypatch) -> TestClient:
     fake_client = MagicMock()
     fake_client.generate_presigned_url.return_value = "https://example.com/presigned"
     monkeypatch.setattr(video_service, "get_presigning_s3_client", lambda: fake_client)
+    monkeypatch.setattr(video_service, "get_sqs_client", lambda: MagicMock())
 
     app.dependency_overrides[get_db_session] = lambda: db
     yield TestClient(app)
@@ -94,3 +95,40 @@ def test_get_video_returns_null_metadata_when_not_yet_extracted(client, db):
     assert response.status_code == 200
     assert response.json()["metadata"] is None
     assert response.json()["assets"] == []
+
+
+def test_retry_video_returns_404_for_unknown_id(client):
+    response = client.post(f"/videos/{uuid.uuid4()}/retry")
+
+    assert response.status_code == 404
+
+
+def test_retry_video_returns_409_when_not_failed(client, db):
+    video = Video(
+        id=uuid.uuid4(),
+        filename="clip.mp4",
+        original_object_key=f"uploads/{uuid.uuid4()}/original.mp4",
+        status=VideoStatus.COMPLETED,
+    )
+    video_repository.create(db, video)
+    db.commit()
+
+    response = client.post(f"/videos/{video.id}/retry")
+
+    assert response.status_code == 409
+
+
+def test_retry_video_moves_failed_video_to_processing(client, db):
+    video = Video(
+        id=uuid.uuid4(),
+        filename="clip.mp4",
+        original_object_key=f"uploads/{uuid.uuid4()}/original.mp4",
+        status=VideoStatus.FAILED,
+    )
+    video_repository.create(db, video)
+    db.commit()
+
+    response = client.post(f"/videos/{video.id}/retry")
+
+    assert response.status_code == 200
+    assert response.json() == {"id": str(video.id), "status": VideoStatus.PROCESSING.value}

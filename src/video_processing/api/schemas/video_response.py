@@ -32,3 +32,8 @@ class GetVideoResponse(BaseModel):
     status: VideoStatus
     metadata: VideoMetadata | None
     assets: list[GeneratedAssetResponse]
+
+
+class RetryVideoResponse(BaseModel):
+    id: uuid.UUID
+    status: VideoStatus

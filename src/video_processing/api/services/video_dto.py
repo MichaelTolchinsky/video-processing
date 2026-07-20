@@ -1,8 +1,9 @@
 """DTOs returned by video_service -- not the API request/response contract.
 
-Kept separate from schemas/video.py (the Pydantic API schemas): these are
-plain dataclasses describing what the service layer hands back to routes,
-which then map them onto the actual response models.
+Lives next to video_service.py (the module that owns and returns these),
+rather than in api/schemas/ alongside video_request.py/video_response.py --
+those are the Pydantic API contract; these are plain dataclasses internal
+to the service layer, which routes map onto the actual response models.
 """
 
 from dataclasses import dataclass
@@ -13,14 +14,14 @@ from video_processing.common.models.video import Video
 
 
 @dataclass
-class CreatedUpload:
+class CreatedUploadDto:
     video: Video
     upload_url: str
     expires_at: datetime
 
 
 @dataclass
-class AssetDownload:
+class AssetDownloadDto:
     asset: GeneratedAsset
     download_url: str
     expires_at: datetime

@@ -54,6 +54,11 @@ class ServicesStack(Stack):
                 resources=[self.video_bucket.arn_for_objects("uploads/*")],
             )
         )
+        # Send-only: the retry endpoint re-publishes an upload's S3 event to
+        # re-drive the worker; the API never consumes/deletes messages.
+        self.processing_queue.grant_send_messages(
+            self.api_task_definition.task_role,
+        )
 
         application_image = ecs.ContainerImage.from_ecr_repository(
             self.container_repository,
@@ -67,6 +72,7 @@ class ServicesStack(Stack):
             environment={
                 "AWS_REGION": self.region,
                 "S3_BUCKET_NAME": self.video_bucket.bucket_name,
+                "SQS_QUEUE_URL": self.processing_queue.queue_url,
             },
         )
 

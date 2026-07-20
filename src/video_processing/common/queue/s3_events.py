@@ -1,15 +1,17 @@
-"""Parsing for the S3 -> SQS `ObjectCreated` event notifications.
+"""Parsing and building for the S3 -> SQS `ObjectCreated` event notifications.
 
 The bucket only publishes notifications for the `uploads/` prefix (configured
 in PlatformStack), so every event this worker receives should reference an
-original video upload, not a generated asset.
+original video upload, not a generated asset. Lives in `common/` because both
+the worker (parses real S3 events) and the API (builds a synthetic one to
+re-drive processing on retry) need this event shape.
 """
 
 import json
 import re
 import uuid
 from dataclasses import dataclass
-from urllib.parse import unquote_plus
+from urllib.parse import quote_plus, unquote_plus
 
 # Matches the object key the API generates for uploads, e.g.
 # "uploads/28e8c6e2-.../original.mp4". The extension is optional because we
@@ -61,3 +63,16 @@ def parse_video_id_from_key(object_key: str) -> uuid.UUID | None:
     if match is None:
         return None
     return uuid.UUID(match.group("video_id"))
+
+
+def build_object_created_message(bucket: str, key: str) -> str:
+    """Build a synthetic ObjectCreated SQS message body for the given key.
+
+    Used to re-drive processing (e.g. on retry) through the exact same path
+    a real S3 upload event takes, instead of duplicating claim/complete
+    logic on the API side. `key` is quoted the same way S3 quotes it in real
+    notifications, so `parse_object_created_events` decodes it back symmetrically.
+    """
+    return json.dumps(
+        {"Records": [{"s3": {"bucket": {"name": bucket}, "object": {"key": quote_plus(key)}}}]}
+    )

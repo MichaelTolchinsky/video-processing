@@ -9,9 +9,11 @@ from video_processing.api.schemas.video_response import (
     CreateVideoResponse,
     GeneratedAssetResponse,
     GetVideoResponse,
+    RetryVideoResponse,
     VideoMetadata,
 )
 from video_processing.api.services import video_service
+from video_processing.api.services.video_service import VideoNotFailedError
 from video_processing.common.db.session import get_db_session
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -65,3 +67,19 @@ def get_video(
         metadata=metadata,
         assets=asset_responses,
     )
+
+
+@router.post("/{video_id}/retry", response_model=RetryVideoResponse)
+def retry_video(
+    video_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> RetryVideoResponse:
+    try:
+        video = video_service.retry_video(db, video_id)
+    except VideoNotFailedError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    if video is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+
+    return RetryVideoResponse(id=video.id, status=video.status)

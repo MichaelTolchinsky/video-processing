@@ -213,7 +213,7 @@ Worker → long-poll SQS (20s)
        → delete the SQS message
 ```
 
-On any exception during processing: `fail_job()` marks the video and whichever jobs are still not `completed` as `failed` (a job that already finished earlier in this same run keeps its `completed` status). The SQS message is **not** deleted, and the function re-raises so the poll loop's `except` block skips the delete. SQS makes the message visible again after its visibility timeout, and another attempt begins automatically -- only the still-incomplete jobs are re-run, thanks to `claim_job` skipping ones already `completed`. After `maxReceiveCount` (3) the message moves to the dead-letter queue. There is currently no separate "give up permanently" step beyond the DLQ — a message parked in the DLQ needs manual intervention (or a future `POST /videos/{id}/retry`).
+On any exception during processing: `fail_job()` marks the video and whichever jobs are still not `completed` as `failed` (a job that already finished earlier in this same run keeps its `completed` status). The SQS message is **not** deleted, and the function re-raises so the poll loop's `except` block skips the delete. SQS makes the message visible again after its visibility timeout, and another attempt begins automatically -- only the still-incomplete jobs are re-run, thanks to `claim_job` skipping ones already `completed`. After `maxReceiveCount` (3) the message moves to the dead-letter queue — a message parked in the DLQ needs manual intervention (redrive, or `POST /videos/{id}/retry` once the underlying issue is fixed).
 
 ### 4. Retrieve status
 
@@ -229,6 +229,21 @@ API → load Video (404 if missing)
 ```
 
 Clients poll this endpoint while `status` is `pending_upload` or `processing`.
+
+### 5. Retry a failed video
+
+```http
+POST /videos/{video_id}/retry
+```
+
+```text
+API → load Video (404 if missing, 409 if status != "failed")
+    → re-publish the original upload's S3 ObjectCreated event to the processing queue
+    → set video status to "processing"
+    ← { id, status }
+```
+
+This doesn't duplicate any claim/complete logic — it re-drives the exact same path a real upload takes. `claim_job` already resumes any job not yet `completed`, so only the jobs that actually failed are re-run; ones that finished before the failure keep their `completed` status untouched. The message is built by `common/queue/s3_events.build_object_created_message`, the producer-side counterpart to the worker's `parse_object_created_events`.
 
 ### Supporting endpoints
 

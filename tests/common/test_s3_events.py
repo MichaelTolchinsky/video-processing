@@ -1,7 +1,8 @@
 import json
 import uuid
 
-from video_processing.worker.s3_events import (
+from video_processing.common.queue.s3_events import (
+    build_object_created_message,
     parse_object_created_events,
     parse_video_id_from_key,
 )
@@ -90,3 +91,15 @@ def test_parse_video_id_from_key_returns_none_for_generated_asset_key():
 
 def test_parse_video_id_from_key_returns_none_for_unrecognized_key():
     assert parse_video_id_from_key("not-a-valid-key") is None
+
+
+def test_build_object_created_message_round_trips_through_parse():
+    key = f"uploads/{_VIDEO_ID}/original.mp4"
+
+    message = build_object_created_message("test-bucket", key)
+
+    events = parse_object_created_events(message)
+    assert len(events) == 1
+    assert events[0].bucket == "test-bucket"
+    assert events[0].key == key
+    assert parse_video_id_from_key(events[0].key) == _VIDEO_ID

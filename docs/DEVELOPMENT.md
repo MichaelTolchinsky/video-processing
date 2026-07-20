@@ -85,7 +85,17 @@ curl http://localhost:8000/videos/PASTE_VIDEO_ID
 
 Expect `status: "completed"`, populated `metadata`, and generated assets: `thumbnail`, plus a `preview_{height}p` rendition for each standard resolution (1080p/720p/480p) strictly below the source's height -- e.g. a 1080p source produces `preview_720p` and `preview_480p` but not a redundant `preview_1080p`. Each asset has a working `download_url`.
 
-**5. Inspect LocalStack directly (optional)**
+**5. Retry a failed video (optional)**
+
+If a video's `status` ends up `"failed"` (e.g. after killing the worker mid-job), re-drive it without re-uploading:
+
+```bash
+curl -X POST http://localhost:8000/videos/PASTE_VIDEO_ID/retry
+```
+
+Returns 409 if the video isn't currently `"failed"`. Re-publishes the original upload's S3 event to the queue, so only the jobs that didn't complete are re-run.
+
+**6. Inspect LocalStack directly (optional)**
 
 ```bash
 # List uploaded originals

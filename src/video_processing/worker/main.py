@@ -18,6 +18,10 @@ from video_processing.common.models.job_status import JobStatus
 from video_processing.common.models.job_type import JobType
 from video_processing.common.models.processing_job import ProcessingJob
 from video_processing.common.models.video import Video
+from video_processing.common.queue.s3_events import (
+    parse_object_created_events,
+    parse_video_id_from_key,
+)
 from video_processing.common.queue.sqs import get_sqs_client
 from video_processing.common.storage.s3 import get_s3_client
 from video_processing.worker.jobs import (
@@ -31,10 +35,6 @@ from video_processing.worker.processing import (
     VideoMetadata,
     extract_metadata,
     generate_thumbnail,
-)
-from video_processing.worker.s3_events import (
-    parse_object_created_events,
-    parse_video_id_from_key,
 )
 from video_processing.worker.transcode import renditions_for_source_height, transcode
 
