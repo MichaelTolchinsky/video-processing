@@ -9,6 +9,17 @@ class Settings(BaseSettings):
     database_username: str | None = None
     database_password: str | None = None
     database_name: str | None = None
+    # Differ per process: the API needs real concurrency (many simultaneous
+    # HTTP requests); the worker's poll loop is strictly serial (one job at a
+    # time) and never needs more than one connection. Set per-container in
+    # services_stack.py / docker-compose.yaml rather than sharing one value.
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    # How long to wait for a pooled connection before giving up. Short on the
+    # API so an exhausted pool fails fast (503) instead of every request
+    # queuing for the full default (30s), which is what turns a capacity
+    # limit into a cascading pileup.
+    db_pool_timeout: int = 30
     aws_region: str
     s3_bucket_name: str
     s3_endpoint_url: str | None = None

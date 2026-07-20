@@ -54,6 +54,11 @@ class ServicesStack(Stack):
                 resources=[self.video_bucket.arn_for_objects("uploads/*")],
             )
         )
+        # Send-only: the retry endpoint re-publishes an upload's S3 event to
+        # re-drive the worker; the API never consumes/deletes messages.
+        self.processing_queue.grant_send_messages(
+            self.api_task_definition.task_role,
+        )
 
         application_image = ecs.ContainerImage.from_ecr_repository(
             self.container_repository,
@@ -67,6 +72,13 @@ class ServicesStack(Stack):
             environment={
                 "AWS_REGION": self.region,
                 "S3_BUCKET_NAME": self.video_bucket.bucket_name,
+                "SQS_QUEUE_URL": self.processing_queue.queue_url,
+                # Needs real concurrency (many simultaneous HTTP requests) and
+                # fails fast under saturation -- short pool_timeout returns a
+                # 503 instead of every request queuing for the default 30s.
+                "DB_POOL_SIZE": "10",
+                "DB_MAX_OVERFLOW": "10",
+                "DB_POOL_TIMEOUT": "5",
             },
         )
 
@@ -143,12 +155,14 @@ class ServicesStack(Stack):
         # The worker is a long-running poller, not an HTTP service: no port
         # mappings, no ALB target, just a Fargate service so it can restart
         # on failure and scale independently of the API (per the NFRs).
+        # Sized above ffmpeg-thumbnail-only needs: transcoding 2-3 resolution
+        # renditions per upload is meaningfully more CPU-bound.
         self.worker_task_definition = ecs.FargateTaskDefinition(
             self,
             "WorkerTaskDefinition",
             family="video-processing-worker",
-            cpu=512,
-            memory_limit_mib=1024,
+            cpu=1024,
+            memory_limit_mib=2048,
         )
         worker_container = self.worker_task_definition.add_container(
             "WorkerContainer",
@@ -159,6 +173,10 @@ class ServicesStack(Stack):
                 "AWS_REGION": self.region,
                 "S3_BUCKET_NAME": self.video_bucket.bucket_name,
                 "SQS_QUEUE_URL": self.processing_queue.queue_url,
+                # The poll loop is strictly serial (one job at a time) --
+                # this is safety margin, not real concurrency need.
+                "DB_POOL_SIZE": "2",
+                "DB_MAX_OVERFLOW": "1",
             },
         )
         for name, secret in database_secrets.items():

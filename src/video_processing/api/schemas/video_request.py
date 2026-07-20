@@ -1,11 +1,6 @@
-import uuid
-from datetime import datetime
 from pathlib import PurePath
 
 from pydantic import BaseModel, Field, field_validator
-
-from video_processing.common.models.asset_type import AssetType
-from video_processing.common.models.video_status import VideoStatus
 
 
 class CreateVideoRequest(BaseModel):
@@ -26,30 +21,3 @@ class CreateVideoRequest(BaseModel):
         if not content_type.startswith("video/"):
             raise ValueError("content_type must be a video type")
         return content_type
-
-
-class CreateVideoResponse(BaseModel):
-    id: uuid.UUID
-    status: VideoStatus
-    upload_url: str
-    expires_at: datetime
-
-
-class VideoMetadata(BaseModel):
-    duration_ms: int
-    width: int
-    height: int
-
-
-class GeneratedAssetResponse(BaseModel):
-    type: AssetType
-    download_url: str
-    expires_at: datetime
-
-
-class GetVideoResponse(BaseModel):
-    id: uuid.UUID
-    filename: str
-    status: VideoStatus
-    metadata: VideoMetadata | None
-    assets: list[GeneratedAssetResponse]

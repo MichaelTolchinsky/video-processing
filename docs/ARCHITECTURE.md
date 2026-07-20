@@ -1,6 +1,6 @@
 # Architecture
 
-Detailed design reference for the platform: networking, security groups, compute, data stores, schemas, system flows, and the v2 plan. See [`readme.md`](../readme.md) for the project overview and [`docs/DEVELOPMENT.md`](DEVELOPMENT.md) for local setup.
+Detailed design reference for the platform: networking, security groups, compute, data stores, schemas, and system flows. See [`readme.md`](../readme.md) for the project overview and [`docs/DEVELOPMENT.md`](DEVELOPMENT.md) for local setup.
 
 ## High-Level Diagram
 
@@ -45,7 +45,7 @@ flowchart LR
 
     S3 -->|ObjectCreated, prefix uploads/| Queue
     Queue -->|long poll| Worker
-    Worker -->|download original, upload thumbnail| S3
+    Worker -->|download original, upload thumbnail + resolution renditions| S3
     Worker -->|:5432 claim job, save metadata/asset| DB
     Worker -->|delete on success| Queue
     Queue -->|maxReceiveCount exceeded| DLQ
@@ -86,7 +86,7 @@ The API and worker security groups are separate so the database's inbound rules 
 
 - **ECS Cluster** — one Fargate cluster hosts all task definitions below; Container Insights enabled.
 - **API Task Definition** (256 CPU / 512 MiB) — runs the FastAPI app on port 8000. Task role: `s3:PutObject` on `uploads/*` only (for presigned upload URLs). Execution role: read access to the RDS secret.
-- **Worker Task Definition** (512 CPU / 1024 MiB) — runs the poll loop (`python -m video_processing.worker.main`), no ports. Task role: `s3:GetObject` on `uploads/*`, `s3:PutObject` on `assets/*`, and SQS consume permissions (receive/delete) on the processing queue.
+- **Worker Task Definition** (1024 CPU / 2048 MiB) — runs the poll loop (`python -m video_processing.worker.main`), no ports. Sized above ffmpeg-thumbnail-only needs since transcoding multiple resolution renditions per upload is meaningfully more CPU-bound. Task role: `s3:GetObject` on `uploads/*`, `s3:PutObject` on `assets/*`, and SQS consume permissions (receive/delete) on the processing queue.
 - **Migration Task Definition** — one-off task running `alembic upgrade head` against RDS; run manually via `ecs run-task`, not part of a service.
 - **Application Load Balancer** — public, listens on 80, forwards to the API service on 8000. Health check: `GET /health/ready` (verifies the API can reach the database, not just that the process is alive).
 
@@ -94,8 +94,8 @@ All three task definitions share the same container image (from ECR) with differ
 
 ## Data Stores
 
-- **Amazon S3** — one bucket, blocks all public access, S3-managed encryption, TLS enforced. `uploads/` holds originals (its `ObjectCreated` events are the only ones routed to SQS); `assets/` holds generated assets like thumbnails (deliberately excluded from the notification filter so the worker's own writes don't retrigger itself).
-- **Amazon RDS (PostgreSQL 16)** — `db.t4g.micro`, single-AZ, 20 GB allocated (autoscales to 50 GB), generated Secrets Manager credentials, private/isolated subnet.
+- **Amazon S3** — one bucket, blocks all public access, S3-managed encryption, TLS enforced. `uploads/` holds originals (its `ObjectCreated` events are the only ones routed to SQS); `assets/` holds generated assets — thumbnails and transcoded resolution renditions — deliberately excluded from the notification filter so the worker's own writes don't retrigger itself.
+- **Amazon RDS (PostgreSQL 16)** — `db.t4g.micro`, single-AZ, 20 GB allocated (autoscales to 50 GB), generated Secrets Manager credentials, private/isolated subnet. Default parameter group caps `max_connections` at ~112 for this instance size; the API's connection pool (20 max: `pool_size=10` + `max_overflow=10`) and the worker's (3 max: strictly serial, one job at a time, so this is safety margin rather than real concurrency need) are both sized with that ceiling in mind, leaving headroom for horizontal scaling later without a config change.
 - **Amazon SQS** — one processing queue (15 min visibility timeout, 20s long polling) plus a dead-letter queue (`maxReceiveCount=3`). S3 publishes directly to it; no SNS fan-out, since there's currently only one consumer.
 - **Amazon ECR** — one repository (`video-processing`), scan-on-push, keeps the last 10 images.
 - **Secrets Manager** — RDS-generated credentials, injected into both the API and worker containers as individual secret fields (host/port/username/password/dbname), not a raw connection string.
@@ -120,7 +120,7 @@ All three task definitions share the same container image (from ECR) with differ
 |---|---|---|
 | `id` | UUID (PK) | |
 | `video_id` | UUID (FK → `videos.id`, cascade delete) | |
-| `job_type` | enum | Currently only `metadata_and_thumbnail`; kept as an enum so the pipeline can add job types later |
+| `job_type` | enum | `metadata` \| `thumbnail` \| `transcode` — independent jobs per video, each claimed/retried on its own; kept as an enum so the pipeline can add job types later |
 | `status` | enum | `pending` \| `processing` \| `completed` \| `failed` |
 | `attempts` | integer | Incremented every time the worker claims the job |
 | `started_at` / `completed_at` | timestamptz, nullable | |
@@ -133,11 +133,11 @@ All three task definitions share the same container image (from ECR) with differ
 |---|---|---|
 | `id` | UUID (PK) | |
 | `video_id` | UUID (FK → `videos.id`, cascade delete) | |
-| `asset_type` | enum | Currently only `thumbnail` |
-| `object_key` | `varchar(1024)`, unique | e.g. `assets/{id}/thumbnail.jpg` |
+| `asset_type` | enum | `thumbnail` \| `preview_1080p` \| `preview_720p` \| `preview_480p` |
+| `object_key` | `varchar(1024)`, unique | e.g. `assets/{id}/thumbnail.jpg` or `assets/{id}/preview_720p.mp4` |
 | `created_at` | timestamptz | |
 
-`UNIQUE(video_id, asset_type)` — one thumbnail per video.
+`UNIQUE(video_id, asset_type)` — one asset per video per type (e.g. only one `preview_720p` rendition per video).
 
 Enums are stored as their lowercase string values (not native PostgreSQL enum types), with a database check constraint — this keeps adding new enum values a simple migration rather than an `ALTER TYPE`.
 
@@ -177,23 +177,43 @@ S3 delivers at-least-once and the object key embeds the video ID, so the worker 
 
 ### 3. Worker processes the video
 
+The worker runs three independent jobs per upload — `metadata`, `thumbnail`, and `transcode` — each its own `ProcessingJob` row, claimed and retried separately. All three currently run within one function call per S3 event (there's no separate scheduling between them; "independent" means independently retryable/observable, not concurrently executed):
+
 ```text
 Worker → long-poll SQS (20s)
        → parse video_id from the object key
        → load Video, verify it matches the event's key
-       → claim_job(): atomically create-or-resume the ProcessingJob,
-                       set video + job status to "processing"
-                       (no-op / skip if the job is already "completed" — handles SQS redelivery)
-       → download original from S3
-       → ffprobe → duration_ms, width, height
-       → ffmpeg  → one thumbnail (frame at 00:00:01)
-       → upload thumbnail to S3 under assets/{id}/thumbnail.jpg
-       → complete_job(): one transaction — save metadata, create GeneratedAsset,
-                          mark video + job "completed"
+       → claim_job() for each of metadata / thumbnail / transcode:
+             atomically create-or-resume that video's ProcessingJob row,
+             set video status to "processing" (unless already "completed")
+             (returns None if that job is already "completed" — handles SQS redelivery;
+              if all three are already done, the event is skipped entirely)
+       → download original from S3 once (shared by whichever jobs still need it)
+
+       → [metadata job] ffprobe → duration_ms, width, height
+                        → complete_metadata_job(): save the fields, mark this job completed
+
+       → [thumbnail job] ffmpeg → one thumbnail (frame at 00:00:01)
+                         → upload to assets/{id}/thumbnail.jpg
+                         → complete_thumbnail_job(): create the GeneratedAsset, mark completed
+                         (independent of the metadata job -- thumbnailing only needs the
+                          downloaded file, not the extracted duration/dimensions)
+
+       → [transcode job] uses metadata.height (this run's, or the video's stored value if
+                          metadata was already done in an earlier attempt) to pick which
+                          renditions to produce: only resolutions strictly below the source
+                          height, from a fixed ladder (1080p/5000kbps, 720p/2500kbps,
+                          480p/1000kbps) -- e.g. a 1080p upload produces 720p + 480p, never a
+                          redundant 1080p copy; a video already at/below 480p produces none
+                         → ffmpeg scale + libx264 encode each rendition at its target bitrate
+                         → upload each to assets/{id}/preview_{height}p.mp4
+                         → complete_transcode_job(): create each GeneratedAsset, mark completed
+
+       → once every job type has a "completed" row for this video, mark the video "completed"
        → delete the SQS message
 ```
 
-On any exception during processing: `fail_job()` marks the video and job `failed`, the SQS message is **not** deleted, and the function re-raises so the poll loop's `except` block skips the delete. SQS makes the message visible again after its visibility timeout, and another attempt begins automatically; after `maxReceiveCount` (3) the message moves to the dead-letter queue. There is currently no separate "give up permanently" step beyond the DLQ — a message parked in the DLQ needs manual intervention (or a future `POST /videos/{id}/retry`).
+On any exception during processing: `fail_job()` marks the video and whichever jobs are still not `completed` as `failed` (a job that already finished earlier in this same run keeps its `completed` status). The SQS message is **not** deleted, and the function re-raises so the poll loop's `except` block skips the delete. SQS makes the message visible again after its visibility timeout, and another attempt begins automatically -- only the still-incomplete jobs are re-run, thanks to `claim_job` skipping ones already `completed`. After `maxReceiveCount` (3) the message moves to the dead-letter queue — a message parked in the DLQ needs manual intervention (redrive, or `POST /videos/{id}/retry` once the underlying issue is fixed).
 
 ### 4. Retrieve status
 
@@ -209,6 +229,21 @@ API → load Video (404 if missing)
 ```
 
 Clients poll this endpoint while `status` is `pending_upload` or `processing`.
+
+### 5. Retry a failed video
+
+```http
+POST /videos/{video_id}/retry
+```
+
+```text
+API → load Video (404 if missing, 409 if status != "failed")
+    → re-publish the original upload's S3 ObjectCreated event to the processing queue
+    → set video status to "processing"
+    ← { id, status }
+```
+
+This doesn't duplicate any claim/complete logic — it re-drives the exact same path a real upload takes. `claim_job` already resumes any job not yet `completed`, so only the jobs that actually failed are re-run; ones that finished before the failure keep their `completed` status untouched. The message is built by `common/queue/s3_events.build_object_created_message`, the producer-side counterpart to the worker's `parse_object_created_events`.
 
 ### Supporting endpoints
 
@@ -229,15 +264,3 @@ ProcessingJob:            pending → processing → completed | failed
 ```
 
 Note that `failed` is not necessarily final: if the same message is redelivered and reprocessed successfully, both rows move back to `completed`. `failed` becomes effectively final only once SQS exhausts its retries and the message lands in the dead-letter queue.
-
-## v2 Plan: Video Embeddings
-
-A natural next iteration once the core pipeline above is solid: extend the processing job to generate a **vector embedding** for each video, enabling semantic/similarity search over the library.
-
-- **New job type** — `JobType.EMBEDDING`, run independently of `metadata_and_thumbnail` (the schema already supports multiple job types per video via `job_type`).
-- **Model** — extract a handful of representative frames (e.g., via the existing `ffmpeg` step) and run them through an image/video embedding model (e.g., CLIP) to produce a fixed-size vector per video.
-- **Storage** — add a `pgvector` column (or a dedicated `video_embeddings` table) to PostgreSQL; RDS PostgreSQL supports the `pgvector` extension without introducing a new datastore.
-- **New endpoint** — `POST /videos/search` accepting a text or image query, embedding it the same way, and returning the nearest videos by vector distance.
-- **Scaling consideration** — embedding generation is more CPU/GPU-intensive than thumbnailing; this would likely warrant its own worker task definition (or GPU-backed Fargate/EC2 capacity) rather than sharing the existing worker's task definition.
-
-This is a planning note, not yet implemented.

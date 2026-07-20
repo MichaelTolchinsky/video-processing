@@ -16,11 +16,10 @@ A small backend platform for uploading a video, processing it asynchronously (me
 ## Features
 
 - **Upload a video** — the client uploads directly to S3 via a presigned URL; video bytes never pass through the API.
-- **Asynchronous processing** — an independently scalable worker service extracts metadata (`ffprobe`) and generates a thumbnail (`ffmpeg`) for every upload, with retries and idempotent processing.
+- **Asynchronous processing** — an independently scalable worker service extracts metadata (`ffprobe`), generates a thumbnail, and transcodes standard-resolution renditions (`ffmpeg`) for every upload, with retries and idempotent processing.
 - **Status retrieval** — poll for processing status, extracted metadata, and presigned download URLs for generated assets.
 
 ## Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — networking, security groups, compute, data model, system flows, and the v2 plan.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — networking, security groups, compute, data model, and system flows.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — local development setup and commands.
-- [`AGENTS.md`](AGENTS.md) — coding conventions and patterns followed in this codebase.

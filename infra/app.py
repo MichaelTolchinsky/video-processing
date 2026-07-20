@@ -43,6 +43,7 @@ PipelineStack(
     cluster=services_stack.cluster,
     api_task_definition=services_stack.api_task_definition,
     worker_task_definition=services_stack.worker_task_definition,
+    migration_task_definition=services_stack.migration_task_definition,
     api_service=services_stack.api_service,
     worker_service=services_stack.worker_service,
     env=cdk.Environment(

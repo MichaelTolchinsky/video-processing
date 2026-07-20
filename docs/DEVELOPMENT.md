@@ -23,6 +23,16 @@ This starts:
 - `db` — PostgreSQL 16 on `localhost:5432`
 - `localstack` — S3 + SQS on `http://localhost:4566`, with the `video-processing-local` bucket and queue created automatically (see `localstack/init-s3.sh` and `localstack/init-sqs.sh`), including the bucket's `uploads/` → queue notification wiring that mirrors production.
 
+## Run the test suite
+
+Unit and integration tests run against an in-memory SQLite database and mocked S3 calls — no Docker/AWS needed:
+
+```bash
+uv run pytest
+```
+
+Covers repositories (`common/db/repositories/`), worker job idempotency/retry logic (`worker/jobs.py`), the API service layer, and HTTP-level route behavior (via FastAPI's `TestClient`). It does not replace the [end-to-end test](#end-to-end-test) below, which is the only check that exercises real ffmpeg/ffprobe and the full worker poll loop.
+
 ## Apply database migrations
 
 The API image doesn't run migrations on startup by design (so a bad migration can't block every container from starting). Run them explicitly:
@@ -39,7 +49,7 @@ Create a new migration after changing a model:
 docker compose run --rm -v "$PWD:/workspace" -w /workspace api alembic revision --autogenerate -m "describe the change"
 ```
 
-Always review the generated migration file before applying it.
+Always review the generated migration file before applying it -- autogenerate is known to be unreliable specifically for the enum columns in this project (`common/models/enum_type.py` uses `create_constraint=True`, an anonymous CHECK constraint, not a native Postgres enum). When an enum gains/loses values, autogenerate tends to emit a same-named `ADD CONSTRAINT` without dropping the old one first, which fails outright; it also won't add a data-fix for rows still holding a removed value, which a straight `ADD CONSTRAINT` would otherwise reject. Expect to hand-write explicit `op.drop_constraint(...)` / `op.create_check_constraint(...)` (and an `op.execute("UPDATE ...")` data-fix if a value was renamed/removed) rather than accepting the generated file as-is.
 
 ## End-to-end test
 
@@ -73,9 +83,19 @@ Expect a "Completed processing for video ..." line within a few seconds.
 curl http://localhost:8000/videos/PASTE_VIDEO_ID
 ```
 
-Expect `status: "completed"`, populated `metadata`, and one `thumbnail` asset with a working `download_url`.
+Expect `status: "completed"`, populated `metadata`, and generated assets: `thumbnail`, plus a `preview_{height}p` rendition for each standard resolution (1080p/720p/480p) strictly below the source's height -- e.g. a 1080p source produces `preview_720p` and `preview_480p` but not a redundant `preview_1080p`. Each asset has a working `download_url`.
 
-**5. Inspect LocalStack directly (optional)**
+**5. Retry a failed video (optional)**
+
+If a video's `status` ends up `"failed"` (e.g. after killing the worker mid-job), re-drive it without re-uploading:
+
+```bash
+curl -X POST http://localhost:8000/videos/PASTE_VIDEO_ID/retry
+```
+
+Returns 409 if the video isn't currently `"failed"`. Re-publishes the original upload's S3 event to the queue, so only the jobs that didn't complete are re-run.
+
+**6. Inspect LocalStack directly (optional)**
 
 ```bash
 # List uploaded originals
@@ -89,6 +109,23 @@ docker compose exec localstack awslocal sqs receive-message \
   --queue-url http://localhost:4566/000000000000/video-processing-local \
   --max-number-of-messages 1 --visibility-timeout 3600
 ```
+
+## Load testing
+
+`k6` (or any HTTP load tool) against the running compose stack, e.g.:
+
+```bash
+k6 run --vus 25 --duration 30s - <<'EOF'
+import http from "k6/http";
+export default function () {
+  http.get("http://localhost:8000/videos/PASTE_VIDEO_ID");
+}
+EOF
+```
+
+**Findings against this local setup** (single uvicorn process, `db.t4g.micro`-equivalent pool sizing): comfortable up to ~80 concurrent users (0% errors, p95 ~120ms, ~550 req/s). The real ceiling is the DB connection pool (`common/db/session.py`, `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` env vars — 20 max for the API), not CPU or memory. Past that ceiling, the pool's short `pool_timeout` (`DB_POOL_TIMEOUT`, 5s on the API) fails requests fast with a `503` instead of every request queuing for the default 30s.
+
+At extreme, unrealistic overload (10x+ the pool's capacity, e.g. 300+ concurrent against a 20-connection pool) some requests can hang indefinitely rather than fail cleanly — a Starlette sync-threadpool + disconnected-client interaction, not something worth solving at the app level for this project's scope. In production this self-heals via the ALB's `/health/ready` check cycling an unresponsive ECS task; locally it needs a manual `docker compose restart api`. Chasing a fully graceful app-level fix for a load level far beyond this project's realistic traffic wasn't worth the added complexity (an attempted DB-side `idle_in_transaction_session_timeout` fix was tried and reverted — it traded a clear failure mode for a more confusing one without actually solving it).
 
 ## Everyday commands
 
