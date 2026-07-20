@@ -73,6 +73,12 @@ class ServicesStack(Stack):
                 "AWS_REGION": self.region,
                 "S3_BUCKET_NAME": self.video_bucket.bucket_name,
                 "SQS_QUEUE_URL": self.processing_queue.queue_url,
+                # Needs real concurrency (many simultaneous HTTP requests) and
+                # fails fast under saturation -- short pool_timeout returns a
+                # 503 instead of every request queuing for the default 30s.
+                "DB_POOL_SIZE": "10",
+                "DB_MAX_OVERFLOW": "10",
+                "DB_POOL_TIMEOUT": "5",
             },
         )
 
@@ -167,6 +173,10 @@ class ServicesStack(Stack):
                 "AWS_REGION": self.region,
                 "S3_BUCKET_NAME": self.video_bucket.bucket_name,
                 "SQS_QUEUE_URL": self.processing_queue.queue_url,
+                # The poll loop is strictly serial (one job at a time) --
+                # this is safety margin, not real concurrency need.
+                "DB_POOL_SIZE": "2",
+                "DB_MAX_OVERFLOW": "1",
             },
         )
         for name, secret in database_secrets.items():

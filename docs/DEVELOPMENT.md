@@ -110,6 +110,23 @@ docker compose exec localstack awslocal sqs receive-message \
   --max-number-of-messages 1 --visibility-timeout 3600
 ```
 
+## Load testing
+
+`k6` (or any HTTP load tool) against the running compose stack, e.g.:
+
+```bash
+k6 run --vus 25 --duration 30s - <<'EOF'
+import http from "k6/http";
+export default function () {
+  http.get("http://localhost:8000/videos/PASTE_VIDEO_ID");
+}
+EOF
+```
+
+**Findings against this local setup** (single uvicorn process, `db.t4g.micro`-equivalent pool sizing): comfortable up to ~80 concurrent users (0% errors, p95 ~120ms, ~550 req/s). The real ceiling is the DB connection pool (`common/db/session.py`, `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` env vars — 20 max for the API), not CPU or memory. Past that ceiling, the pool's short `pool_timeout` (`DB_POOL_TIMEOUT`, 5s on the API) fails requests fast with a `503` instead of every request queuing for the default 30s.
+
+At extreme, unrealistic overload (10x+ the pool's capacity, e.g. 300+ concurrent against a 20-connection pool) some requests can hang indefinitely rather than fail cleanly — a Starlette sync-threadpool + disconnected-client interaction, not something worth solving at the app level for this project's scope. In production this self-heals via the ALB's `/health/ready` check cycling an unresponsive ECS task; locally it needs a manual `docker compose restart api`. Chasing a fully graceful app-level fix for a load level far beyond this project's realistic traffic wasn't worth the added complexity (an attempted DB-side `idle_in_transaction_session_timeout` fix was tried and reverted — it traded a clear failure mode for a more confusing one without actually solving it).
+
 ## Everyday commands
 
 ```bash
