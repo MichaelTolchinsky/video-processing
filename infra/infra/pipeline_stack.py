@@ -28,6 +28,7 @@ class PipelineStack(Stack):
         cluster: ecs.ICluster,
         api_task_definition: ecs.FargateTaskDefinition,
         worker_task_definition: ecs.FargateTaskDefinition,
+        migration_task_definition: ecs.FargateTaskDefinition,
         api_service: ecs.FargateService,
         worker_service: ecs.FargateService,
         **kwargs,
@@ -137,9 +138,11 @@ class PipelineStack(Stack):
             api_task_definition.execution_role,
             worker_task_definition.task_role,
             worker_task_definition.execution_role,
+            migration_task_definition.task_role,
+            migration_task_definition.execution_role,
         ]
         if any(role is None for role in passable_roles):
-            raise ValueError("API and worker task definitions must have execution roles")
+            raise ValueError("Task definitions must have execution roles")
 
         self.deploy_role.add_to_principal_policy(
             iam.PolicyStatement(

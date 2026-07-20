@@ -4,9 +4,16 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  # One deploy at a time: queue a second push rather than let two runs race
+  # (two migration tasks, or two overlapping service updates).
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   AWS_REGION: eu-north-1
   ECS_STACK_NAME: ServicesStack
+  PLATFORM_STACK_NAME: PlatformStack
 
 jobs:
   lint:
@@ -24,8 +31,23 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
 
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - run: uv sync --locked
+      - run: uv run pytest
+
   deploy:
-    needs: lint
+    needs: [lint, test]
     runs-on: ubuntu-latest
     permissions:
       # id-token: write is what lets this job exchange a GitHub-issued OIDC
@@ -51,7 +73,7 @@ jobs:
             --stack-name "${{ env.ECS_STACK_NAME }}" \
             --query 'Stacks[0].Outputs' --output json)
           platform_outputs=$(aws cloudformation describe-stacks \
-            --stack-name PlatformStack \
+            --stack-name "${{ env.PLATFORM_STACK_NAME }}" \
             --query 'Stacks[0].Outputs' --output json)
 
           value() { echo "$1" | jq -r --arg key "$2" '.[] | select(.OutputKey==$key) | .OutputValue'; }
