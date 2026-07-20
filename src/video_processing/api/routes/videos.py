@@ -4,8 +4,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from video_processing.api.schemas.video import (
-    CreateVideoRequest,
+from video_processing.api.schemas.video_request import CreateVideoRequest
+from video_processing.api.schemas.video_response import (
     CreateVideoResponse,
     GeneratedAssetResponse,
     GetVideoResponse,

@@ -23,6 +23,16 @@ This starts:
 - `db` — PostgreSQL 16 on `localhost:5432`
 - `localstack` — S3 + SQS on `http://localhost:4566`, with the `video-processing-local` bucket and queue created automatically (see `localstack/init-s3.sh` and `localstack/init-sqs.sh`), including the bucket's `uploads/` → queue notification wiring that mirrors production.
 
+## Run the test suite
+
+Unit and integration tests run against an in-memory SQLite database and mocked S3 calls — no Docker/AWS needed:
+
+```bash
+uv run pytest
+```
+
+Covers repositories (`common/db/repositories/`), worker job idempotency/retry logic (`worker/jobs.py`), the API service layer, and HTTP-level route behavior (via FastAPI's `TestClient`). It does not replace the [end-to-end test](#end-to-end-test) below, which is the only check that exercises real ffmpeg/ffprobe and the full worker poll loop.
+
 ## Apply database migrations
 
 The API image doesn't run migrations on startup by design (so a bad migration can't block every container from starting). Run them explicitly:
