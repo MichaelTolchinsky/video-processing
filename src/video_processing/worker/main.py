@@ -98,6 +98,20 @@ def _run_transcode_job(
     complete_transcode_job(db, job, video, renditions)
 
 
+def _download_original(object_key: str, work_dir: Path) -> Path:
+    original_path = work_dir / "original"
+    get_s3_client().download_file(settings.s3_bucket_name, object_key, str(original_path))
+    return original_path
+
+
+def _fail_incomplete_jobs(
+    db: Session, jobs: tuple[ProcessingJob | None, ...], video: Video
+) -> None:
+    for job in jobs:
+        if job is not None and job.status != JobStatus.COMPLETED:
+            fail_job(db, job, video)
+
+
 def process_uploaded_object(object_key: str) -> None:
     video_id = parse_video_id_from_key(object_key)
     if video_id is None:
@@ -131,10 +145,7 @@ def process_uploaded_object(object_key: str) -> None:
         try:
             with tempfile.TemporaryDirectory() as work_dir_str:
                 work_dir = Path(work_dir_str)
-                original_path = work_dir / "original"
-                get_s3_client().download_file(
-                    settings.s3_bucket_name, object_key, str(original_path)
-                )
+                original_path = _download_original(object_key, work_dir)
 
                 metadata = None
                 if metadata_job is not None:
@@ -153,9 +164,7 @@ def process_uploaded_object(object_key: str) -> None:
             logger.info("Completed processing for video %s", video_id)
         except Exception:
             logger.exception("Processing failed for video %s", video_id)
-            for job in (metadata_job, thumbnail_job, transcode_job):
-                if job is not None and job.status != JobStatus.COMPLETED:
-                    fail_job(db, job, video)
+            _fail_incomplete_jobs(db, (metadata_job, thumbnail_job, transcode_job), video)
             # Re-raise so the poll loop knows not to delete the SQS message.
             raise
 
