@@ -23,4 +23,3 @@ A small backend platform for uploading a video, processing it asynchronously (me
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — networking, security groups, compute, data model, and system flows.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — local development setup and commands.
-- [`AGENTS.md`](AGENTS.md) — coding conventions and patterns followed in this codebase.
