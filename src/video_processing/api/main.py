@@ -5,7 +5,14 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from video_processing.api.routes.health import router as health_router
 from video_processing.api.routes.videos import router as videos_router
 
-app = FastAPI(title="Video Processing API")
+app = FastAPI(
+    title="Video Processing API",
+    description=(
+        "Upload videos, track async processing (metadata, thumbnail, "
+        "transcoding), and retrieve results."
+    ),
+    version="1.0.0",
+)
 
 app.include_router(health_router)
 app.include_router(videos_router)
