@@ -57,6 +57,7 @@ async def _run_metadata_job(
 
 
 async def _run_thumbnail_job(
+    s3: AioBaseClient,
     db: AsyncSession,
     job: ProcessingJob,
     video: Video,
@@ -68,12 +69,12 @@ async def _run_thumbnail_job(
     await generate_thumbnail(original_path, thumbnail_path)
 
     thumbnail_key = f"{_ASSETS_PREFIX}/{video_id}/thumbnail.jpg"
-    async with get_async_s3_client() as s3:
-        await s3.upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
+    await s3.upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
     await complete_thumbnail_job(db, job, video, thumbnail_key)
 
 
 async def _run_transcode_job(
+    s3: AioBaseClient,
     db: AsyncSession,
     job: ProcessingJob,
     video: Video,
@@ -90,22 +91,20 @@ async def _run_transcode_job(
         raise RuntimeError(f"Video {video_id} has no known height to transcode against")
 
     renditions = []
-    async with get_async_s3_client() as s3:
-        for rendition in renditions_for_source_height(source_height):
-            rendition_path = work_dir / f"{rendition.asset_type.value}.mp4"
-            await transcode(original_path, rendition_path, rendition)
+    for rendition in renditions_for_source_height(source_height):
+        rendition_path = work_dir / f"{rendition.asset_type.value}.mp4"
+        await transcode(original_path, rendition_path, rendition)
 
-            rendition_key = f"{_ASSETS_PREFIX}/{video_id}/{rendition.asset_type.value}.mp4"
-            await s3.upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
-            renditions.append((rendition.asset_type, rendition_key))
+        rendition_key = f"{_ASSETS_PREFIX}/{video_id}/{rendition.asset_type.value}.mp4"
+        await s3.upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
+        renditions.append((rendition.asset_type, rendition_key))
 
     await complete_transcode_job(db, job, video, renditions)
 
 
-async def _download_original(object_key: str, work_dir: Path) -> Path:
+async def _download_original(s3: AioBaseClient, object_key: str, work_dir: Path) -> Path:
     original_path = work_dir / "original"
-    async with get_async_s3_client() as s3:
-        await s3.download_file(settings.s3_bucket_name, object_key, str(original_path))
+    await s3.download_file(settings.s3_bucket_name, object_key, str(original_path))
     return original_path
 
 
@@ -148,23 +147,31 @@ async def process_uploaded_object(object_key: str) -> None:
             return
 
         try:
-            with tempfile.TemporaryDirectory() as work_dir_str:
-                work_dir = Path(work_dir_str)
-                original_path = await _download_original(object_key, work_dir)
+            async with get_async_s3_client() as s3:
+                with tempfile.TemporaryDirectory() as work_dir_str:
+                    work_dir = Path(work_dir_str)
+                    original_path = await _download_original(s3, object_key, work_dir)
 
-                metadata = None
-                if metadata_job is not None:
-                    metadata = await _run_metadata_job(db, metadata_job, video, original_path)
+                    metadata = None
+                    if metadata_job is not None:
+                        metadata = await _run_metadata_job(db, metadata_job, video, original_path)
 
-                if thumbnail_job is not None:
-                    await _run_thumbnail_job(
-                        db, thumbnail_job, video, video_id, original_path, work_dir
-                    )
+                    if thumbnail_job is not None:
+                        await _run_thumbnail_job(
+                            s3, db, thumbnail_job, video, video_id, original_path, work_dir
+                        )
 
-                if transcode_job is not None:
-                    await _run_transcode_job(
-                        db, transcode_job, video, video_id, original_path, work_dir, metadata
-                    )
+                    if transcode_job is not None:
+                        await _run_transcode_job(
+                            s3,
+                            db,
+                            transcode_job,
+                            video,
+                            video_id,
+                            original_path,
+                            work_dir,
+                            metadata,
+                        )
 
             logger.info("Completed processing for video %s", video_id)
         except Exception:
