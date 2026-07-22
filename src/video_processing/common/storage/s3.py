@@ -1,6 +1,4 @@
 import aioboto3
-import boto3
-from botocore.client import BaseClient
 from botocore.config import Config
 
 from video_processing.common.config.settings import settings
@@ -10,16 +8,16 @@ _S3_CONFIG = Config(s3={"addressing_style": "path"})
 _async_session = aioboto3.Session()
 
 
-def get_s3_client() -> BaseClient:
-    """Client for direct S3 access from inside the VPC.
+def get_async_s3_client() -> aioboto3.session.ClientCreatorContext:
+    """Async client for direct S3 access from inside the VPC.
 
     Used by the worker to download originals and upload generated assets;
     unlike the API, it never hands URLs to an external client, so it has
-    no need for the public/presigning endpoint. Stays sync/boto3 -- the
-    worker's poll loop is strictly sequential, so there's nothing async
-    would buy it (see worker/main.py).
+    no need for the public/presigning endpoint. Async so the worker can
+    download/upload several videos' files concurrently instead of one
+    blocking transfer serializing every other in-flight job.
     """
-    return boto3.client(
+    return _async_session.client(
         "s3",
         region_name=settings.aws_region,
         endpoint_url=settings.s3_endpoint_url,

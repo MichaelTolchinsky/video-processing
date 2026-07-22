@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from aiobotocore.client import AioBaseClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from video_processing.common.config.settings import settings
@@ -23,8 +24,8 @@ from video_processing.common.queue.s3_events import (
     parse_object_created_events,
     parse_video_id_from_key,
 )
-from video_processing.common.queue.sqs import get_sqs_client
-from video_processing.common.storage.s3 import get_s3_client
+from video_processing.common.queue.sqs import get_async_sqs_client
+from video_processing.common.storage.s3 import get_async_s3_client
 from video_processing.worker.jobs import (
     claim_job,
     complete_metadata_job,
@@ -50,7 +51,7 @@ _ASSETS_PREFIX = "assets"
 async def _run_metadata_job(
     db: AsyncSession, job: ProcessingJob, video: Video, original_path: Path
 ) -> VideoMetadata:
-    metadata = extract_metadata(original_path)
+    metadata = await extract_metadata(original_path)
     await complete_metadata_job(db, job, video, metadata)
     return metadata
 
@@ -64,10 +65,11 @@ async def _run_thumbnail_job(
     work_dir: Path,
 ) -> None:
     thumbnail_path = work_dir / "thumbnail.jpg"
-    generate_thumbnail(original_path, thumbnail_path)
+    await generate_thumbnail(original_path, thumbnail_path)
 
     thumbnail_key = f"{_ASSETS_PREFIX}/{video_id}/thumbnail.jpg"
-    get_s3_client().upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
+    async with get_async_s3_client() as s3:
+        await s3.upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
     await complete_thumbnail_job(db, job, video, thumbnail_key)
 
 
@@ -88,20 +90,22 @@ async def _run_transcode_job(
         raise RuntimeError(f"Video {video_id} has no known height to transcode against")
 
     renditions = []
-    for rendition in renditions_for_source_height(source_height):
-        rendition_path = work_dir / f"{rendition.asset_type.value}.mp4"
-        transcode(original_path, rendition_path, rendition)
+    async with get_async_s3_client() as s3:
+        for rendition in renditions_for_source_height(source_height):
+            rendition_path = work_dir / f"{rendition.asset_type.value}.mp4"
+            await transcode(original_path, rendition_path, rendition)
 
-        rendition_key = f"{_ASSETS_PREFIX}/{video_id}/{rendition.asset_type.value}.mp4"
-        get_s3_client().upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
-        renditions.append((rendition.asset_type, rendition_key))
+            rendition_key = f"{_ASSETS_PREFIX}/{video_id}/{rendition.asset_type.value}.mp4"
+            await s3.upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
+            renditions.append((rendition.asset_type, rendition_key))
 
     await complete_transcode_job(db, job, video, renditions)
 
 
-def _download_original(object_key: str, work_dir: Path) -> Path:
+async def _download_original(object_key: str, work_dir: Path) -> Path:
     original_path = work_dir / "original"
-    get_s3_client().download_file(settings.s3_bucket_name, object_key, str(original_path))
+    async with get_async_s3_client() as s3:
+        await s3.download_file(settings.s3_bucket_name, object_key, str(original_path))
     return original_path
 
 
@@ -146,7 +150,7 @@ async def process_uploaded_object(object_key: str) -> None:
         try:
             with tempfile.TemporaryDirectory() as work_dir_str:
                 work_dir = Path(work_dir_str)
-                original_path = _download_original(object_key, work_dir)
+                original_path = await _download_original(object_key, work_dir)
 
                 metadata = None
                 if metadata_job is not None:
@@ -175,28 +179,49 @@ async def process_message(message: dict[str, Any]) -> None:
         await process_uploaded_object(event.key)
 
 
-async def run() -> None:
-    sqs = get_sqs_client()
-    logger.info("Worker started; polling %s", settings.sqs_queue_url)
+async def _handle_message(sqs: AioBaseClient, message: dict[str, Any]) -> None:
+    """Process one message and delete it on success.
 
-    while True:
-        response = sqs.receive_message(
-            QueueUrl=settings.sqs_queue_url,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=20,  # long polling, matches the queue's configuration
-        )
-        for message in response.get("Messages", []):
-            try:
-                await process_message(message)
-            except Exception:
-                # Leave the message in the queue: SQS makes it visible again
-                # after the visibility timeout so it can be retried, and
-                # eventually moves it to the dead-letter queue.
-                continue
-            sqs.delete_message(
+    Isolated per-message (own try/except) so `asyncio.gather` on a batch
+    lets every other in-flight video finish even if this one fails --
+    failures here just leave the message for SQS to redeliver/DLQ, same as
+    the previous single-message loop.
+    """
+    try:
+        await process_message(message)
+    except Exception:
+        # Leave the message in the queue: SQS makes it visible again after
+        # the visibility timeout so it can be retried, and eventually moves
+        # it to the dead-letter queue.
+        return
+    await sqs.delete_message(
+        QueueUrl=settings.sqs_queue_url,
+        ReceiptHandle=message["ReceiptHandle"],
+    )
+
+
+async def run() -> None:
+    # SQS caps a single receive_message call at 10 messages.
+    batch_size = min(settings.worker_concurrency, 10)
+    logger.info(
+        "Worker started; polling %s (concurrency=%d)", settings.sqs_queue_url, batch_size
+    )
+
+    async with get_async_sqs_client() as sqs:
+        while True:
+            response = await sqs.receive_message(
                 QueueUrl=settings.sqs_queue_url,
-                ReceiptHandle=message["ReceiptHandle"],
+                MaxNumberOfMessages=batch_size,
+                WaitTimeSeconds=20,  # long polling, matches the queue's configuration
             )
+            messages = response.get("Messages", [])
+            if messages:
+                # Each video's ffmpeg/ffprobe calls are separate OS
+                # processes, so this is genuine parallelism, not just
+                # interleaved I/O waits -- bounded by batch_size (see
+                # Settings.worker_concurrency) to match the task's CPU
+                # budget instead of thrashing it.
+                await asyncio.gather(*(_handle_message(sqs, message) for message in messages))
 
 
 if __name__ == "__main__":

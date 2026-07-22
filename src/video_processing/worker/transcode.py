@@ -4,7 +4,7 @@ Kept separate from processing.py (metadata/thumbnail) since it has its own
 resolution-selection logic — matches the project's one-concern-per-file split.
 """
 
-import subprocess
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,19 +37,20 @@ def renditions_for_source_height(source_height: int) -> list[Rendition]:
     return [rendition for rendition in _RENDITIONS if rendition.height < source_height]
 
 
-def transcode(video_path: Path, output_path: Path, rendition: Rendition) -> None:
+async def transcode(video_path: Path, output_path: Path, rendition: Rendition) -> None:
     """Scale to `rendition.height` (preserving aspect ratio) at its target bitrate."""
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i", str(video_path),
-            "-vf", f"scale=-2:{rendition.height}",
-            "-c:v", "libx264",
-            "-b:v", f"{rendition.bitrate_kbps}k",
-            "-c:a", "aac",
-            str(output_path),
-        ],
-        capture_output=True,
-        check=True,
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-vf", f"scale=-2:{rendition.height}",
+        "-c:v", "libx264",
+        "-b:v", f"{rendition.bitrate_kbps}k",
+        "-c:a", "aac",
+        str(output_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    _stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"ffmpeg transcode exited with {process.returncode}: {stderr.decode()}")
