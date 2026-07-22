@@ -10,9 +10,10 @@ class Settings(BaseSettings):
     database_password: str | None = None
     database_name: str | None = None
     # Differ per process: the API needs real concurrency (many simultaneous
-    # HTTP requests); the worker's poll loop is strictly serial (one job at a
-    # time) and never needs more than one connection. Set per-container in
-    # services_stack.py / docker-compose.yaml rather than sharing one value.
+    # HTTP requests); the worker needs at least worker_concurrency connections
+    # (each concurrently-processed video holds one for its full duration). Set
+    # per-container in services_stack.py / docker-compose.yaml rather than
+    # sharing one value.
     db_pool_size: int = 5
     db_max_overflow: int = 5
     # How long to wait for a pooled connection before giving up. Short on the
@@ -26,6 +27,11 @@ class Settings(BaseSettings):
     s3_public_endpoint_url: str | None = None
     sqs_queue_url: str | None = None
     sqs_endpoint_url: str | None = None
+    # How many SQS messages (videos) the worker processes concurrently.
+    # Bounded by ffmpeg's CPU cost per video and the Fargate task's vCPUs --
+    # too high just adds context-switching, not real throughput. SQS itself
+    # caps a single receive_message call at 10.
+    worker_concurrency: int = 2
 
     @property
     def sqlalchemy_database_url(self) -> str:
@@ -51,6 +57,17 @@ class Settings(BaseSettings):
             port=self.database_port,
             database=self.database_name,
         ).render_as_string(hide_password=False)
+
+    @property
+    def async_sqlalchemy_database_url(self) -> str:
+        """Same connection, asyncpg driver -- used by the API/worker engine.
+
+        Alembic (sqlalchemy_database_url, psycopg) stays sync: migrations
+        don't run concurrently, so there's nothing for async to buy there.
+        """
+        return self.sqlalchemy_database_url.replace(
+            "postgresql+psycopg://", "postgresql+asyncpg://", 1
+        )
 
 
 settings = Settings()

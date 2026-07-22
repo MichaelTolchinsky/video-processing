@@ -2,7 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from video_processing.common.db.session import get_db_session
 
@@ -24,9 +24,9 @@ def live() -> dict[str, str]:
     description="Confirms the process can serve traffic by checking the database connection.",
     responses={503: {"description": "Database is not reachable"}},
 )
-def ready(db: Annotated[Session, Depends(get_db_session)]) -> dict[str, str]:
+async def ready(db: Annotated[AsyncSession, Depends(get_db_session)]) -> dict[str, str]:
     try:
-        db.execute(text("SELECT 1"))
+        await db.execute(text("SELECT 1"))
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

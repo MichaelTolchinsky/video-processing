@@ -127,6 +127,38 @@ EOF
 
 At extreme, unrealistic overload (10x+ the pool's capacity, e.g. 300+ concurrent against a 20-connection pool) some requests can hang indefinitely rather than fail cleanly — a Starlette sync-threadpool + disconnected-client interaction, not something worth solving at the app level for this project's scope. In production this self-heals via the ALB's `/health/ready` check cycling an unresponsive ECS task; locally it needs a manual `docker compose restart api`. Chasing a fully graceful app-level fix for a load level far beyond this project's realistic traffic wasn't worth the added complexity (an attempted DB-side `idle_in_transaction_session_timeout` fix was tried and reverted — it traded a clear failure mode for a more confusing one without actually solving it).
 
+**Against the deployed AWS stack** (single small Fargate task + `db.t4g.micro`-class RDS), the ceiling is much lower: 0% errors up to ~60 concurrent (p95 ~700ms), climbing to ~29% timeout failures by 150-250 concurrent. Same root cause as local -- DB pool exhaustion, just reached sooner with less real capacity behind it. The fix there is more pool/RDS capacity or ECS desired-count, not application code.
+
+**Bumped to "small startup" pool sizes** (API `DB_POOL_SIZE=30`/`DB_MAX_OVERFLOW=20`, worker `WORKER_CONCURRENCY=4`) against the same local stack: 0% errors up to ~700 concurrent (~1480 req/s, p95 ~756ms), degrading to ~14% failures by 1500 concurrent, with throughput plateauing around ~1450 req/s. That plateau is a different, higher-order bottleneck now (single uvicorn process/CPU core), not the DB pool -- confirming async paid off here by letting one process hold far more concurrent in-flight requests against a bigger pool, not by making any single request faster.
+
+**Retry/failure behavior**, verified with two real scenarios: a permanently-broken upload correctly redelivers via SQS (~30s local visibility timeout) and resumes with `attempts` incrementing (1->2->...) -- there's no DLQ configured locally (unlike prod's 15min visibility + `maxReceiveCount=3`), so a truly broken message retries forever here. A worker killed mid-transcode correctly left `metadata`/`thumbnail` completed and only `transcode` incomplete; on restart, the worker resumed just that job with no duplicate reprocessing, confirming the idempotent-resume design holds under a real crash, not just in theory.
+
+## Estimated scale
+
+Rough, honest numbers for planning purposes -- not a guarantee, and the worker side in particular is a methodology, not a measured throughput, since video length/resolution varies too much for one number to mean anything.
+
+**API (read/status endpoints):**
+
+| Setup | Concurrent users @ 0% errors | Throughput | Bottleneck |
+|---|---|---|---|
+| Local, default pool (`DB_POOL_SIZE=10`/`+10` overflow) | ~80 | ~550 req/s | DB pool |
+| Local, "small startup" pool (`30`/`+20`) | ~700 | ~1480 req/s | Single uvicorn process/CPU core |
+| Deployed AWS, 1 Fargate task + `db.t4g.micro` | ~60 | -- | DB pool |
+
+Extrapolating to a realistic small-startup deployment (2-3 Fargate API tasks behind the ALB, `db.t4g.small`/`medium` RDS, pool sized like the "small startup" row per task): comfortably **several hundred concurrent users / low thousands of req/s** for status/read traffic, scaling roughly linearly with task count until Postgres itself (not the app) becomes the limit -- which needs its own headroom check (`db.t4g.small` tops out around 100-200 native connections, so pool size per task x task count must stay under that with margin).
+
+**Worker (video processing):**
+
+No single "videos/hour" number is honest here -- a 10s clip and a 45-minute 4K upload cost wildly different ffmpeg time. The model instead: each worker task processes up to `WORKER_CONCURRENCY` videos in parallel (default 2 in prod, tested up to 4 locally), bounded by the task's vCPUs (`cpu=1024` = 1 vCPU currently -- true parallel encoding needs `cpu` raised alongside `WORKER_CONCURRENCY`, or concurrency mostly just overlaps I/O with another job's CPU-bound encode instead of running both at once). Real throughput = `WORKER_CONCURRENCY x (task vCPUs / 1) x (3600 / avg_seconds_per_video)`, and scales further by adding more worker tasks (fully independent, SQS handles distribution with no coordination needed). Sizing this for real needs a measured `avg_seconds_per_video` against representative uploads -- worth doing before trusting any specific videos/hour figure.
+
+## Async API (DB + S3/SQS)
+
+The API service (routes -> `video_service` -> repositories -> DB) is fully async: SQLAlchemy's `AsyncSession` over `asyncpg`, and `aioboto3` for the API's S3 presigning/SQS calls. This was a deliberate learning/production-realism exercise (matching how bigger async FastAPI services are typically built), **not a fix for the load-test ceiling above** -- the bottleneck is the DB connection pool, and async doesn't create more pool connections or make Postgres answer faster. Confirmed by design, not just asserted: the numbers above were unaffected by this migration.
+
+The worker is fully async too: `ffmpeg`/`ffprobe` run via `asyncio.create_subprocess_exec` (not blocking `subprocess.run`), S3 downloads/uploads use the async `get_async_s3_client`, and the poll loop fetches a batch of up to `WORKER_CONCURRENCY` SQS messages (default 2, capped at SQS's own 10-per-call limit) and processes them concurrently via `asyncio.gather` -- each video is a separate ffmpeg/ffprobe OS process, so this is genuine parallelism, not just interleaved I/O waits. Bump `WORKER_CONCURRENCY` alongside the Fargate task's `cpu` (currently 1024 = 1 vCPU) and `DB_POOL_SIZE` (must cover one connection per concurrently-processed video) together -- raising one without the others either starves the pool or just adds context-switching with no real throughput gain. Verified locally with two videos uploaded simultaneously: both landed in one `receive_message` batch and completed together.
+
+Notable friction hit along the way: `aioboto3` pins `boto3` to a specific compatible range and lags official `boto3` releases, forcing a `boto3` downgrade (`1.43.51` -> `1.40.61`) when it was added -- a recurring real-world cost of this dependency, not a one-time fix.
+
 ## Everyday commands
 
 ```bash

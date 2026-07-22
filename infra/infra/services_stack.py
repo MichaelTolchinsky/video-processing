@@ -173,10 +173,15 @@ class ServicesStack(Stack):
                 "AWS_REGION": self.region,
                 "S3_BUCKET_NAME": self.video_bucket.bucket_name,
                 "SQS_QUEUE_URL": self.processing_queue.queue_url,
-                # The poll loop is strictly serial (one job at a time) --
-                # this is safety margin, not real concurrency need.
+                # Must cover WORKER_CONCURRENCY concurrent videos, each
+                # holding one connection for its full processing duration.
+                # cpu=1024 (1 vCPU) means concurrency mostly overlaps I/O
+                # (S3 transfer) with another job's CPU-bound ffmpeg, rather
+                # than true parallel encoding -- bump cpu alongside this if
+                # WORKER_CONCURRENCY increases.
                 "DB_POOL_SIZE": "2",
                 "DB_MAX_OVERFLOW": "1",
+                "WORKER_CONCURRENCY": "2",
             },
         )
         for name, secret in database_secrets.items():

@@ -4,13 +4,15 @@ This is a plain poll loop, not a web service — the worker has no HTTP
 endpoints to serve, so it needs no FastAPI/Uvicorn, just a running process.
 """
 
+import asyncio
 import logging
 import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.orm import Session
+from aiobotocore.client import AioBaseClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from video_processing.common.config.settings import settings
 from video_processing.common.db.session import SessionFactory
@@ -22,8 +24,8 @@ from video_processing.common.queue.s3_events import (
     parse_object_created_events,
     parse_video_id_from_key,
 )
-from video_processing.common.queue.sqs import get_sqs_client
-from video_processing.common.storage.s3 import get_s3_client
+from video_processing.common.queue.sqs import get_async_sqs_client
+from video_processing.common.storage.s3 import get_async_s3_client
 from video_processing.worker.jobs import (
     claim_job,
     complete_metadata_job,
@@ -46,16 +48,17 @@ logger = logging.getLogger(__name__)
 _ASSETS_PREFIX = "assets"
 
 
-def _run_metadata_job(
-    db: Session, job: ProcessingJob, video: Video, original_path: Path
+async def _run_metadata_job(
+    db: AsyncSession, job: ProcessingJob, video: Video, original_path: Path
 ) -> VideoMetadata:
-    metadata = extract_metadata(original_path)
-    complete_metadata_job(db, job, video, metadata)
+    metadata = await extract_metadata(original_path)
+    await complete_metadata_job(db, job, video, metadata)
     return metadata
 
 
-def _run_thumbnail_job(
-    db: Session,
+async def _run_thumbnail_job(
+    s3: AioBaseClient,
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     video_id: uuid.UUID,
@@ -63,15 +66,16 @@ def _run_thumbnail_job(
     work_dir: Path,
 ) -> None:
     thumbnail_path = work_dir / "thumbnail.jpg"
-    generate_thumbnail(original_path, thumbnail_path)
+    await generate_thumbnail(original_path, thumbnail_path)
 
     thumbnail_key = f"{_ASSETS_PREFIX}/{video_id}/thumbnail.jpg"
-    get_s3_client().upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
-    complete_thumbnail_job(db, job, video, thumbnail_key)
+    await s3.upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
+    await complete_thumbnail_job(db, job, video, thumbnail_key)
 
 
-def _run_transcode_job(
-    db: Session,
+async def _run_transcode_job(
+    s3: AioBaseClient,
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     video_id: uuid.UUID,
@@ -89,37 +93,37 @@ def _run_transcode_job(
     renditions = []
     for rendition in renditions_for_source_height(source_height):
         rendition_path = work_dir / f"{rendition.asset_type.value}.mp4"
-        transcode(original_path, rendition_path, rendition)
+        await transcode(original_path, rendition_path, rendition)
 
         rendition_key = f"{_ASSETS_PREFIX}/{video_id}/{rendition.asset_type.value}.mp4"
-        get_s3_client().upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
+        await s3.upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
         renditions.append((rendition.asset_type, rendition_key))
 
-    complete_transcode_job(db, job, video, renditions)
+    await complete_transcode_job(db, job, video, renditions)
 
 
-def _download_original(object_key: str, work_dir: Path) -> Path:
+async def _download_original(s3: AioBaseClient, object_key: str, work_dir: Path) -> Path:
     original_path = work_dir / "original"
-    get_s3_client().download_file(settings.s3_bucket_name, object_key, str(original_path))
+    await s3.download_file(settings.s3_bucket_name, object_key, str(original_path))
     return original_path
 
 
-def _fail_incomplete_jobs(
-    db: Session, jobs: tuple[ProcessingJob | None, ...], video: Video
+async def _fail_incomplete_jobs(
+    db: AsyncSession, jobs: tuple[ProcessingJob | None, ...], video: Video
 ) -> None:
     for job in jobs:
         if job is not None and job.status != JobStatus.COMPLETED:
-            fail_job(db, job, video)
+            await fail_job(db, job, video)
 
 
-def process_uploaded_object(object_key: str) -> None:
+async def process_uploaded_object(object_key: str) -> None:
     video_id = parse_video_id_from_key(object_key)
     if video_id is None:
         logger.warning("Ignoring unrecognized object key: %s", object_key)
         return
 
-    with SessionFactory() as db:
-        video = db.get(Video, video_id)
+    async with SessionFactory() as db:
+        video = await db.get(Video, video_id)
         # Compare against the artifact-free key (see s3_events.py) so this
         # still recognizes a legitimate match locally; `object_key` itself is
         # left untouched below since S3 downloads need the exact, real key.
@@ -135,68 +139,97 @@ def process_uploaded_object(object_key: str) -> None:
         # redelivery). Metadata and thumbnail are independent of each other
         # (thumbnailing only needs the downloaded file); transcode is the
         # only one that depends on another job's output (metadata.height).
-        metadata_job = claim_job(db, video, JobType.METADATA)
-        thumbnail_job = claim_job(db, video, JobType.THUMBNAIL)
-        transcode_job = claim_job(db, video, JobType.TRANSCODE)
+        metadata_job = await claim_job(db, video, JobType.METADATA)
+        thumbnail_job = await claim_job(db, video, JobType.THUMBNAIL)
+        transcode_job = await claim_job(db, video, JobType.TRANSCODE)
         if metadata_job is None and thumbnail_job is None and transcode_job is None:
             logger.info("All jobs already completed for video %s; skipping", video_id)
             return
 
         try:
-            with tempfile.TemporaryDirectory() as work_dir_str:
-                work_dir = Path(work_dir_str)
-                original_path = _download_original(object_key, work_dir)
+            async with get_async_s3_client() as s3:
+                with tempfile.TemporaryDirectory() as work_dir_str:
+                    work_dir = Path(work_dir_str)
+                    original_path = await _download_original(s3, object_key, work_dir)
 
-                metadata = None
-                if metadata_job is not None:
-                    metadata = _run_metadata_job(db, metadata_job, video, original_path)
+                    metadata = None
+                    if metadata_job is not None:
+                        metadata = await _run_metadata_job(db, metadata_job, video, original_path)
 
-                if thumbnail_job is not None:
-                    _run_thumbnail_job(
-                        db, thumbnail_job, video, video_id, original_path, work_dir
-                    )
+                    if thumbnail_job is not None:
+                        await _run_thumbnail_job(
+                            s3, db, thumbnail_job, video, video_id, original_path, work_dir
+                        )
 
-                if transcode_job is not None:
-                    _run_transcode_job(
-                        db, transcode_job, video, video_id, original_path, work_dir, metadata
-                    )
+                    if transcode_job is not None:
+                        await _run_transcode_job(
+                            s3,
+                            db,
+                            transcode_job,
+                            video,
+                            video_id,
+                            original_path,
+                            work_dir,
+                            metadata,
+                        )
 
             logger.info("Completed processing for video %s", video_id)
         except Exception:
             logger.exception("Processing failed for video %s", video_id)
-            _fail_incomplete_jobs(db, (metadata_job, thumbnail_job, transcode_job), video)
+            await _fail_incomplete_jobs(db, (metadata_job, thumbnail_job, transcode_job), video)
             # Re-raise so the poll loop knows not to delete the SQS message.
             raise
 
 
-def process_message(message: dict[str, Any]) -> None:
+async def process_message(message: dict[str, Any]) -> None:
     for event in parse_object_created_events(message["Body"]):
-        process_uploaded_object(event.key)
+        await process_uploaded_object(event.key)
 
 
-def run() -> None:
-    sqs = get_sqs_client()
-    logger.info("Worker started; polling %s", settings.sqs_queue_url)
+async def _handle_message(sqs: AioBaseClient, message: dict[str, Any]) -> None:
+    """Process one message and delete it on success.
 
-    while True:
-        response = sqs.receive_message(
-            QueueUrl=settings.sqs_queue_url,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=20,  # long polling, matches the queue's configuration
-        )
-        for message in response.get("Messages", []):
-            try:
-                process_message(message)
-            except Exception:
-                # Leave the message in the queue: SQS makes it visible again
-                # after the visibility timeout so it can be retried, and
-                # eventually moves it to the dead-letter queue.
-                continue
-            sqs.delete_message(
+    Isolated per-message (own try/except) so `asyncio.gather` on a batch
+    lets every other in-flight video finish even if this one fails --
+    failures here just leave the message for SQS to redeliver/DLQ, same as
+    the previous single-message loop.
+    """
+    try:
+        await process_message(message)
+    except Exception:
+        # Leave the message in the queue: SQS makes it visible again after
+        # the visibility timeout so it can be retried, and eventually moves
+        # it to the dead-letter queue.
+        return
+    await sqs.delete_message(
+        QueueUrl=settings.sqs_queue_url,
+        ReceiptHandle=message["ReceiptHandle"],
+    )
+
+
+async def run() -> None:
+    # SQS caps a single receive_message call at 10 messages.
+    batch_size = min(settings.worker_concurrency, 10)
+    logger.info(
+        "Worker started; polling %s (concurrency=%d)", settings.sqs_queue_url, batch_size
+    )
+
+    async with get_async_sqs_client() as sqs:
+        while True:
+            response = await sqs.receive_message(
                 QueueUrl=settings.sqs_queue_url,
-                ReceiptHandle=message["ReceiptHandle"],
+                MaxNumberOfMessages=batch_size,
+                WaitTimeSeconds=20,  # long polling, matches the queue's configuration
             )
+            messages = response.get("Messages", [])
+            if messages:
+                # Each video's ffmpeg/ffprobe calls are separate OS
+                # processes, so this is genuine parallelism, not just
+                # interleaved I/O waits -- bounded by batch_size (see
+                # Settings.worker_concurrency) to match the task's CPU
+                # budget instead of thrashing it.
+                await asyncio.gather(*(_handle_message(sqs, message) for message in messages))
 
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(run())

@@ -4,8 +4,8 @@ Kept separate from database and SQS/S3 concerns so this module is just
 "local file in, local file/data out" and easy to reason about on its own.
 """
 
+import asyncio
 import json
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,22 +21,37 @@ class VideoMetadata:
     height: int
 
 
-def extract_metadata(video_path: Path) -> VideoMetadata:
-    """Run ffprobe to read duration and the first video stream's dimensions."""
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "error",
-            "-print_format", "json",
-            "-show_entries", "format=duration:stream=width,height",
-            "-select_streams", "v:0",
-            str(video_path),
-        ],
-        capture_output=True,
-        check=True,
-        text=True,
+async def _run(*args: str) -> bytes:
+    """Run a subprocess without blocking the event loop.
+
+    Required for real concurrency: `subprocess.run` blocks the single
+    worker event loop, which would serialize every "concurrent" video
+    behind whichever one is currently probing/encoding.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    probe = json.loads(result.stdout)
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Command {args!r} exited with {process.returncode}: {stderr.decode()}"
+        )
+    return stdout
+
+
+async def extract_metadata(video_path: Path) -> VideoMetadata:
+    """Run ffprobe to read duration and the first video stream's dimensions."""
+    stdout = await _run(
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_entries", "format=duration:stream=width,height",
+        "-select_streams", "v:0",
+        str(video_path),
+    )
+    probe = json.loads(stdout)
     stream = probe["streams"][0]
     duration_seconds = float(probe["format"]["duration"])
     return VideoMetadata(
@@ -46,17 +61,13 @@ def extract_metadata(video_path: Path) -> VideoMetadata:
     )
 
 
-def generate_thumbnail(video_path: Path, thumbnail_path: Path) -> None:
+async def generate_thumbnail(video_path: Path, thumbnail_path: Path) -> None:
     """Extract a single frame near the start of the video as a JPEG thumbnail."""
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i", str(video_path),
-            "-ss", _THUMBNAIL_OFFSET,
-            "-frames:v", "1",
-            str(thumbnail_path),
-        ],
-        capture_output=True,
-        check=True,
+    await _run(
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-ss", _THUMBNAIL_OFFSET,
+        "-frames:v", "1",
+        str(thumbnail_path),
     )

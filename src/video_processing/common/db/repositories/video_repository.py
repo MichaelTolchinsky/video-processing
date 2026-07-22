@@ -7,14 +7,14 @@ stays with the calling business logic, not here.
 
 import uuid
 
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from video_processing.common.models.video import Video
 
 
-def get_by_id(db: Session, video_id: uuid.UUID) -> Video | None:
-    return db.get(Video, video_id)
+async def get_by_id(db: AsyncSession, video_id: uuid.UUID) -> Video | None:
+    return await db.get(Video, video_id)
 
 
-def create(db: Session, video: Video) -> None:
+def create(db: AsyncSession, video: Video) -> None:
     db.add(video)
