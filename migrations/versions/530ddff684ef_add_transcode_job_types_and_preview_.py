@@ -29,15 +29,6 @@ def upgrade() -> None:
     # existing rows, so a still-present 'metadata_and_thumbnail' row would
     # be rejected outright).
 
-    # JobType.METADATA_AND_THUMBNAIL was split into separate METADATA and
-    # THUMBNAIL job types; rewrite any existing rows to the new METADATA
-    # value first so they satisfy the new constraint below instead of being
-    # orphaned by the rename.
-    op.execute(
-        "UPDATE processing_jobs SET job_type = 'metadata' "
-        "WHERE job_type = 'metadata_and_thumbnail'"
-    )
-
     op.drop_constraint('assettype', 'generated_assets', type_='check')
     op.alter_column(
         'generated_assets', 'asset_type',
@@ -51,6 +42,17 @@ def upgrade() -> None:
     )
 
     op.drop_constraint('jobtype', 'processing_jobs', type_='check')
+
+    # JobType.METADATA_AND_THUMBNAIL was split into separate METADATA and
+    # THUMBNAIL job types; rewrite any existing rows to the new METADATA
+    # value now that the old constraint is gone -- running this before the
+    # drop has the still-active old constraint (which only allowed
+    # 'metadata_and_thumbnail') reject the new value outright.
+    op.execute(
+        "UPDATE processing_jobs SET job_type = 'metadata' "
+        "WHERE job_type = 'metadata_and_thumbnail'"
+    )
+
     op.alter_column(
         'processing_jobs', 'job_type',
         existing_type=sa.VARCHAR(length=22),
