@@ -19,7 +19,16 @@ from video_processing.common.db.session import get_db_session
 router = APIRouter(prefix="/videos", tags=["videos"])
 
 
-@router.post("", response_model=CreateVideoResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=CreateVideoResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Start a video upload",
+    description=(
+        "Creates a pending video record and returns a presigned S3 URL "
+        "to upload the file to directly."
+    ),
+)
 def create_video(
     request: CreateVideoRequest,
     db: Annotated[Session, Depends(get_db_session)],
@@ -33,7 +42,16 @@ def create_video(
     )
 
 
-@router.get("/{video_id}", response_model=GetVideoResponse)
+@router.get(
+    "/{video_id}",
+    response_model=GetVideoResponse,
+    summary="Get video status and results",
+    description=(
+        "Returns processing status, extracted metadata, and presigned "
+        "download URLs for any generated assets."
+    ),
+    responses={404: {"description": "Video not found"}},
+)
 def get_video(
     video_id: uuid.UUID,
     db: Annotated[Session, Depends(get_db_session)],
@@ -69,7 +87,19 @@ def get_video(
     )
 
 
-@router.post("/{video_id}/retry", response_model=RetryVideoResponse)
+@router.post(
+    "/{video_id}/retry",
+    response_model=RetryVideoResponse,
+    summary="Retry a failed video",
+    description=(
+        "Re-publishes the original upload's S3 event to re-drive "
+        "processing. Only allowed while status is 'failed'."
+    ),
+    responses={
+        404: {"description": "Video not found"},
+        409: {"description": "Video is not in a failed state"},
+    },
+)
 def retry_video(
     video_id: uuid.UUID,
     db: Annotated[Session, Depends(get_db_session)],
