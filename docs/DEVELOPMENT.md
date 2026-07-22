@@ -127,6 +127,16 @@ EOF
 
 At extreme, unrealistic overload (10x+ the pool's capacity, e.g. 300+ concurrent against a 20-connection pool) some requests can hang indefinitely rather than fail cleanly — a Starlette sync-threadpool + disconnected-client interaction, not something worth solving at the app level for this project's scope. In production this self-heals via the ALB's `/health/ready` check cycling an unresponsive ECS task; locally it needs a manual `docker compose restart api`. Chasing a fully graceful app-level fix for a load level far beyond this project's realistic traffic wasn't worth the added complexity (an attempted DB-side `idle_in_transaction_session_timeout` fix was tried and reverted — it traded a clear failure mode for a more confusing one without actually solving it).
 
+**Against the deployed AWS stack** (single small Fargate task + `db.t4g.micro`-class RDS), the ceiling is much lower: 0% errors up to ~60 concurrent (p95 ~700ms), climbing to ~29% timeout failures by 150-250 concurrent. Same root cause as local -- DB pool exhaustion, just reached sooner with less real capacity behind it. The fix there is more pool/RDS capacity or ECS desired-count, not application code.
+
+## Async API (DB + S3/SQS)
+
+The API service (routes -> `video_service` -> repositories -> DB) is fully async: SQLAlchemy's `AsyncSession` over `asyncpg`, and `aioboto3` for the API's S3 presigning/SQS calls. This was a deliberate learning/production-realism exercise (matching how bigger async FastAPI services are typically built), **not a fix for the load-test ceiling above** -- the bottleneck is the DB connection pool, and async doesn't create more pool connections or make Postgres answer faster. Confirmed by design, not just asserted: the numbers above were unaffected by this migration.
+
+The worker stays sync-styled internally but is wrapped in a single `asyncio.run(run())` so it can call the now-async repositories/`worker/jobs.py` -- its poll loop is still strictly sequential (`MaxNumberOfMessages=1`), and its real bottleneck (blocking `ffmpeg`/`ffprobe` subprocess calls) isn't something async buys anything for without a separate redesign to process multiple jobs concurrently. It keeps the sync `boto3` clients (`get_s3_client`/`get_sqs_client` in `common/storage/s3.py`/`common/queue/sqs.py`); the API uses the async variants (`get_async_presigning_s3_client`/`get_async_sqs_client`) instead.
+
+Notable friction hit along the way: `aioboto3` pins `boto3` to a specific compatible range and lags official `boto3` releases, forcing a `boto3` downgrade (`1.43.51` -> `1.40.61`) when it was added -- a recurring real-world cost of this dependency, not a one-time fix.
+
 ## Everyday commands
 
 ```bash

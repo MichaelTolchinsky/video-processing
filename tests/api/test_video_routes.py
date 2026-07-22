@@ -1,9 +1,10 @@
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import fake_async_client
 from video_processing.api.main import app
 from video_processing.api.services import video_service
 from video_processing.common.db.repositories import generated_asset_repository, video_repository
@@ -16,12 +17,19 @@ from video_processing.common.models.video_status import VideoStatus
 
 @pytest.fixture
 def client(db, monkeypatch) -> TestClient:
-    fake_client = MagicMock()
+    fake_client = AsyncMock()
     fake_client.generate_presigned_url.return_value = "https://example.com/presigned"
-    monkeypatch.setattr(video_service, "get_presigning_s3_client", lambda: fake_client)
-    monkeypatch.setattr(video_service, "get_sqs_client", lambda: MagicMock())
+    monkeypatch.setattr(
+        video_service, "get_async_presigning_s3_client", lambda: fake_async_client(fake_client)
+    )
+    monkeypatch.setattr(
+        video_service, "get_async_sqs_client", lambda: fake_async_client(AsyncMock())
+    )
 
-    app.dependency_overrides[get_db_session] = lambda: db
+    async def _override_db():
+        yield db
+
+    app.dependency_overrides[get_db_session] = _override_db
     yield TestClient(app)
     app.dependency_overrides.clear()
 
@@ -48,7 +56,7 @@ def test_get_video_returns_404_for_unknown_id(client):
     assert response.status_code == 404
 
 
-def test_get_video_returns_metadata_and_assets(client, db):
+async def test_get_video_returns_metadata_and_assets(client, db):
     video = Video(
         id=uuid.uuid4(),
         filename="clip.mp4",
@@ -67,7 +75,7 @@ def test_get_video_returns_metadata_and_assets(client, db):
             object_key=f"assets/{video.id}/thumbnail.jpg",
         ),
     )
-    db.commit()
+    await db.commit()
 
     response = client.get(f"/videos/{video.id}")
 
@@ -80,7 +88,7 @@ def test_get_video_returns_metadata_and_assets(client, db):
     assert body["assets"][0]["download_url"] == "https://example.com/presigned"
 
 
-def test_get_video_returns_null_metadata_when_not_yet_extracted(client, db):
+async def test_get_video_returns_null_metadata_when_not_yet_extracted(client, db):
     video = Video(
         id=uuid.uuid4(),
         filename="clip.mp4",
@@ -88,7 +96,7 @@ def test_get_video_returns_null_metadata_when_not_yet_extracted(client, db):
         status=VideoStatus.PROCESSING,
     )
     video_repository.create(db, video)
-    db.commit()
+    await db.commit()
 
     response = client.get(f"/videos/{video.id}")
 
@@ -103,7 +111,7 @@ def test_retry_video_returns_404_for_unknown_id(client):
     assert response.status_code == 404
 
 
-def test_retry_video_returns_409_when_not_failed(client, db):
+async def test_retry_video_returns_409_when_not_failed(client, db):
     video = Video(
         id=uuid.uuid4(),
         filename="clip.mp4",
@@ -111,14 +119,14 @@ def test_retry_video_returns_409_when_not_failed(client, db):
         status=VideoStatus.COMPLETED,
     )
     video_repository.create(db, video)
-    db.commit()
+    await db.commit()
 
     response = client.post(f"/videos/{video.id}/retry")
 
     assert response.status_code == 409
 
 
-def test_retry_video_moves_failed_video_to_processing(client, db):
+async def test_retry_video_moves_failed_video_to_processing(client, db):
     video = Video(
         id=uuid.uuid4(),
         filename="clip.mp4",
@@ -126,7 +134,7 @@ def test_retry_video_moves_failed_video_to_processing(client, db):
         status=VideoStatus.FAILED,
     )
     video_repository.create(db, video)
-    db.commit()
+    await db.commit()
 
     response = client.post(f"/videos/{video.id}/retry")
 

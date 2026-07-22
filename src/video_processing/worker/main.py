@@ -4,13 +4,14 @@ This is a plain poll loop, not a web service — the worker has no HTTP
 endpoints to serve, so it needs no FastAPI/Uvicorn, just a running process.
 """
 
+import asyncio
 import logging
 import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from video_processing.common.config.settings import settings
 from video_processing.common.db.session import SessionFactory
@@ -46,16 +47,16 @@ logger = logging.getLogger(__name__)
 _ASSETS_PREFIX = "assets"
 
 
-def _run_metadata_job(
-    db: Session, job: ProcessingJob, video: Video, original_path: Path
+async def _run_metadata_job(
+    db: AsyncSession, job: ProcessingJob, video: Video, original_path: Path
 ) -> VideoMetadata:
     metadata = extract_metadata(original_path)
-    complete_metadata_job(db, job, video, metadata)
+    await complete_metadata_job(db, job, video, metadata)
     return metadata
 
 
-def _run_thumbnail_job(
-    db: Session,
+async def _run_thumbnail_job(
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     video_id: uuid.UUID,
@@ -67,11 +68,11 @@ def _run_thumbnail_job(
 
     thumbnail_key = f"{_ASSETS_PREFIX}/{video_id}/thumbnail.jpg"
     get_s3_client().upload_file(str(thumbnail_path), settings.s3_bucket_name, thumbnail_key)
-    complete_thumbnail_job(db, job, video, thumbnail_key)
+    await complete_thumbnail_job(db, job, video, thumbnail_key)
 
 
-def _run_transcode_job(
-    db: Session,
+async def _run_transcode_job(
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     video_id: uuid.UUID,
@@ -95,7 +96,7 @@ def _run_transcode_job(
         get_s3_client().upload_file(str(rendition_path), settings.s3_bucket_name, rendition_key)
         renditions.append((rendition.asset_type, rendition_key))
 
-    complete_transcode_job(db, job, video, renditions)
+    await complete_transcode_job(db, job, video, renditions)
 
 
 def _download_original(object_key: str, work_dir: Path) -> Path:
@@ -104,22 +105,22 @@ def _download_original(object_key: str, work_dir: Path) -> Path:
     return original_path
 
 
-def _fail_incomplete_jobs(
-    db: Session, jobs: tuple[ProcessingJob | None, ...], video: Video
+async def _fail_incomplete_jobs(
+    db: AsyncSession, jobs: tuple[ProcessingJob | None, ...], video: Video
 ) -> None:
     for job in jobs:
         if job is not None and job.status != JobStatus.COMPLETED:
-            fail_job(db, job, video)
+            await fail_job(db, job, video)
 
 
-def process_uploaded_object(object_key: str) -> None:
+async def process_uploaded_object(object_key: str) -> None:
     video_id = parse_video_id_from_key(object_key)
     if video_id is None:
         logger.warning("Ignoring unrecognized object key: %s", object_key)
         return
 
-    with SessionFactory() as db:
-        video = db.get(Video, video_id)
+    async with SessionFactory() as db:
+        video = await db.get(Video, video_id)
         # Compare against the artifact-free key (see s3_events.py) so this
         # still recognizes a legitimate match locally; `object_key` itself is
         # left untouched below since S3 downloads need the exact, real key.
@@ -135,9 +136,9 @@ def process_uploaded_object(object_key: str) -> None:
         # redelivery). Metadata and thumbnail are independent of each other
         # (thumbnailing only needs the downloaded file); transcode is the
         # only one that depends on another job's output (metadata.height).
-        metadata_job = claim_job(db, video, JobType.METADATA)
-        thumbnail_job = claim_job(db, video, JobType.THUMBNAIL)
-        transcode_job = claim_job(db, video, JobType.TRANSCODE)
+        metadata_job = await claim_job(db, video, JobType.METADATA)
+        thumbnail_job = await claim_job(db, video, JobType.THUMBNAIL)
+        transcode_job = await claim_job(db, video, JobType.TRANSCODE)
         if metadata_job is None and thumbnail_job is None and transcode_job is None:
             logger.info("All jobs already completed for video %s; skipping", video_id)
             return
@@ -149,32 +150,32 @@ def process_uploaded_object(object_key: str) -> None:
 
                 metadata = None
                 if metadata_job is not None:
-                    metadata = _run_metadata_job(db, metadata_job, video, original_path)
+                    metadata = await _run_metadata_job(db, metadata_job, video, original_path)
 
                 if thumbnail_job is not None:
-                    _run_thumbnail_job(
+                    await _run_thumbnail_job(
                         db, thumbnail_job, video, video_id, original_path, work_dir
                     )
 
                 if transcode_job is not None:
-                    _run_transcode_job(
+                    await _run_transcode_job(
                         db, transcode_job, video, video_id, original_path, work_dir, metadata
                     )
 
             logger.info("Completed processing for video %s", video_id)
         except Exception:
             logger.exception("Processing failed for video %s", video_id)
-            _fail_incomplete_jobs(db, (metadata_job, thumbnail_job, transcode_job), video)
+            await _fail_incomplete_jobs(db, (metadata_job, thumbnail_job, transcode_job), video)
             # Re-raise so the poll loop knows not to delete the SQS message.
             raise
 
 
-def process_message(message: dict[str, Any]) -> None:
+async def process_message(message: dict[str, Any]) -> None:
     for event in parse_object_created_events(message["Body"]):
-        process_uploaded_object(event.key)
+        await process_uploaded_object(event.key)
 
 
-def run() -> None:
+async def run() -> None:
     sqs = get_sqs_client()
     logger.info("Worker started; polling %s", settings.sqs_queue_url)
 
@@ -186,7 +187,7 @@ def run() -> None:
         )
         for message in response.get("Messages", []):
             try:
-                process_message(message)
+                await process_message(message)
             except Exception:
                 # Leave the message in the queue: SQS makes it visible again
                 # after the visibility timeout so it can be retried, and
@@ -199,4 +200,4 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(run())

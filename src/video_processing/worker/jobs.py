@@ -9,7 +9,7 @@ semantics, transaction boundaries) built on top of them.
 from datetime import UTC, datetime
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from video_processing.common.db.repositories import (
     generated_asset_repository,
@@ -25,7 +25,7 @@ from video_processing.common.models.video_status import VideoStatus
 from video_processing.worker.processing import VideoMetadata
 
 
-def claim_job(db: Session, video: Video, job_type: JobType) -> ProcessingJob | None:
+async def claim_job(db: AsyncSession, video: Video, job_type: JobType) -> ProcessingJob | None:
     """Create or resume this video's job of the given type, atomically.
 
     S3 delivers ObjectCreated events at least once, and a message can also be
@@ -35,17 +35,19 @@ def claim_job(db: Session, video: Video, job_type: JobType) -> ProcessingJob | N
     Returns None if the job is already completed, so the caller can treat the
     message as a harmless duplicate and acknowledge it without reprocessing.
     """
-    job = processing_job_repository.get_by_video_and_type(db, video.id, job_type)
+    job = await processing_job_repository.get_by_video_and_type(db, video.id, job_type)
     if job is None:
         job = ProcessingJob(video_id=video.id, job_type=job_type)
         processing_job_repository.create(db, job)
         try:
-            db.commit()
+            await db.commit()
         except IntegrityError:
             # Another worker claimed it first (unique video_id + job_type);
             # fall back to the row it created instead of erroring out.
-            db.rollback()
-            job = processing_job_repository.get_by_video_and_type(db, video.id, job_type)
+            await db.rollback()
+            job = await processing_job_repository.get_by_video_and_type(
+                db, video.id, job_type
+            )
 
     if job.status == JobStatus.COMPLETED:
         return None
@@ -57,26 +59,28 @@ def claim_job(db: Session, video: Video, job_type: JobType) -> ProcessingJob | N
     # finished first) back to "processing" for display purposes.
     if video.status != VideoStatus.COMPLETED:
         video.status = VideoStatus.PROCESSING
-    db.commit()
+    await db.commit()
     return job
 
 
-def _all_jobs_completed(db: Session, video: Video) -> bool:
+async def _all_jobs_completed(db: AsyncSession, video: Video) -> bool:
     """Whether every job type this video should have has completed.
 
     Every upload triggers one ProcessingJob per JobType (see worker/main.py),
     so "all done" is simply "as many completed rows as there are job types".
     """
-    completed_count = processing_job_repository.count_completed_for_video(db, video.id)
+    completed_count = await processing_job_repository.count_completed_for_video(db, video.id)
     return completed_count >= len(JobType.__members__)
 
 
-def _upsert_asset(db: Session, video: Video, asset_type: AssetType, object_key: str) -> None:
+async def _upsert_asset(
+    db: AsyncSession, video: Video, asset_type: AssetType, object_key: str
+) -> None:
     """Insert the generated asset, or update its key if retrying after a
     partial prior failure already wrote one (avoids the UNIQUE(video_id,
     asset_type) constraint rejecting the retry).
     """
-    existing = generated_asset_repository.get_by_video_and_type(db, video.id, asset_type)
+    existing = await generated_asset_repository.get_by_video_and_type(db, video.id, asset_type)
     if existing is not None:
         existing.object_key = object_key
     else:
@@ -85,8 +89,8 @@ def _upsert_asset(db: Session, video: Video, asset_type: AssetType, object_key: 
         )
 
 
-def complete_metadata_job(
-    db: Session,
+async def complete_metadata_job(
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     metadata: VideoMetadata,
@@ -97,13 +101,13 @@ def complete_metadata_job(
     video.height = metadata.height
     job.status = JobStatus.COMPLETED
     job.completed_at = datetime.now(UTC)
-    if _all_jobs_completed(db, video):
+    if await _all_jobs_completed(db, video):
         video.status = VideoStatus.COMPLETED
-    db.commit()
+    await db.commit()
 
 
-def complete_thumbnail_job(
-    db: Session,
+async def complete_thumbnail_job(
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     thumbnail_object_key: str,
@@ -115,14 +119,14 @@ def complete_thumbnail_job(
     """
     job.status = JobStatus.COMPLETED
     job.completed_at = datetime.now(UTC)
-    _upsert_asset(db, video, AssetType.THUMBNAIL, thumbnail_object_key)
-    if _all_jobs_completed(db, video):
+    await _upsert_asset(db, video, AssetType.THUMBNAIL, thumbnail_object_key)
+    if await _all_jobs_completed(db, video):
         video.status = VideoStatus.COMPLETED
-    db.commit()
+    await db.commit()
 
 
-def complete_transcode_job(
-    db: Session,
+async def complete_transcode_job(
+    db: AsyncSession,
     job: ProcessingJob,
     video: Video,
     renditions: list[tuple[AssetType, str]],
@@ -136,13 +140,13 @@ def complete_transcode_job(
     job.status = JobStatus.COMPLETED
     job.completed_at = datetime.now(UTC)
     for asset_type, object_key in renditions:
-        _upsert_asset(db, video, asset_type, object_key)
-    if _all_jobs_completed(db, video):
+        await _upsert_asset(db, video, asset_type, object_key)
+    if await _all_jobs_completed(db, video):
         video.status = VideoStatus.COMPLETED
-    db.commit()
+    await db.commit()
 
 
-def fail_job(db: Session, job: ProcessingJob, video: Video) -> None:
+async def fail_job(db: AsyncSession, job: ProcessingJob, video: Video) -> None:
     """Mark the job and video failed.
 
     The SQS message is left undeleted by the caller, so SQS will redeliver
@@ -151,4 +155,4 @@ def fail_job(db: Session, job: ProcessingJob, video: Video) -> None:
     """
     job.status = JobStatus.FAILED
     video.status = VideoStatus.FAILED
-    db.commit()
+    await db.commit()

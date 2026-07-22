@@ -52,5 +52,16 @@ class Settings(BaseSettings):
             database=self.database_name,
         ).render_as_string(hide_password=False)
 
+    @property
+    def async_sqlalchemy_database_url(self) -> str:
+        """Same connection, asyncpg driver -- used by the API/worker engine.
+
+        Alembic (sqlalchemy_database_url, psycopg) stays sync: migrations
+        don't run concurrently, so there's nothing for async to buy there.
+        """
+        return self.sqlalchemy_database_url.replace(
+            "postgresql+psycopg://", "postgresql+asyncpg://", 1
+        )
+
 
 settings = Settings()
