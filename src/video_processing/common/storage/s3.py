@@ -1,4 +1,5 @@
 import aioboto3
+from aiobotocore.session import ClientCreatorContext
 from botocore.config import Config
 
 from video_processing.common.config.settings import settings
@@ -8,7 +9,7 @@ _S3_CONFIG = Config(s3={"addressing_style": "path"})
 _async_session = aioboto3.Session()
 
 
-def get_async_s3_client() -> aioboto3.session.ClientCreatorContext:
+def get_async_s3_client() -> ClientCreatorContext:
     """Async client for direct S3 access from inside the VPC.
 
     Used by the worker to download originals and upload generated assets;
@@ -25,7 +26,7 @@ def get_async_s3_client() -> aioboto3.session.ClientCreatorContext:
     )
 
 
-def get_async_presigning_s3_client() -> aioboto3.session.ClientCreatorContext:
+def get_async_presigning_s3_client() -> ClientCreatorContext:
     """Async client for the API's presigned upload/download URLs.
 
     Returns an async context manager (aioboto3 clients are used via
